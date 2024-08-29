@@ -18,7 +18,8 @@ const int PWM_L=9;
 float Angle;
 float angle_X; //calculate the inclined angle variable of X-axis by accelerometer
 float angle_Y; //calculate the inclined angle variable of Y-axis by accelerometer
-float angle0 = 1.8; //Actual measured angle (ideally 0 degrees) 
+float angle0 = 1.8; //Actual measured angle (ideally 0 degrees)   
+// this 1.8 ain't right, but neither is 1.0.  I am not sure what it should be.  More testing is needed.
 float Gyro_x,Gyro_y,Gyro_z;  //Angular angular velocity for gyroscope calculation
 ///////////////////////angle parameters//////////////////////////////
 
