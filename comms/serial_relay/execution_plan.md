@@ -70,7 +70,9 @@ Subsystems:
    - STA optional; configured via web UI; credentials saved persistently.
 
 5. **HTTP server**
-   - Minimal status page and minimal config page.
+  - Minimal status page and minimal config page.
+  - `/` status page.
+  - `/config` WiFi configuration page.
 
 6. **SignalR client**
    - Negotiate → WebSocket connect → handshake → send/receive.
@@ -150,11 +152,11 @@ Each milestone should be a clean commit point (even if you don’t commit, treat
 
 **Implement**
 - On boot, attempt to connect to a local WiFi AP in STA mode for **at least 60 seconds**.
-  - If compile-time STA credentials are provided, try those.
-  - Otherwise, attempt to connect using any previously saved credentials (`WiFi.begin()` with no args).
+  - Use credentials loaded from persisted storage (Preferences/NVS).
 - If STA connect fails after the timeout, start SoftAP.
 - Start a minimal HTTP server with:
   - `GET /` → status (WiFi mode + IP info, uptime, UART counters)
+  - Provide a link to `/config`.
 
 **Acceptance**
 - Device attempts STA for ~60 seconds before falling back.
@@ -170,15 +172,24 @@ Each milestone should be a clean commit point (even if you don’t commit, treat
 ### M5 — Config Page + Persistent Storage
 
 **Implement**
-- Add `GET /config` and `POST /config` (or a single page with form submit) to set:
-  - STA SSID
-  - STA password
-  - Server Origin (for SignalR)
-- Store values in NVS using `Preferences`.
+- Add a minimal WiFi config webpage:
+  - `GET /config` shows a form to set STA credentials.
+  - `POST /config` saves the provided values.
+- Persist values in NVS using `Preferences`:
+  - Store at minimum:
+    - `sta_ssid`
+    - `sta_pass`
+  - (Later) store `server_origin` for SignalR.
+- On boot, retrieve the stored credentials and attempt STA connect using them before falling back to AP.
+- After successfully saving config, reboot (simple and reliable for early milestones).
 
 **Acceptance**
-- Set values, reboot, confirm values persist.
-- Status page displays the configured Server Origin.
+- When in AP mode, you can browse to `http://192.168.4.1/config`, enter SSID/password, and submit.
+- Device responds that settings are saved and reboots.
+- After reboot:
+  - The device attempts STA connect using the saved credentials.
+  - If it connects, `GET /` is reachable at `http://<sta_ip>/` and shows WiFi mode `STA`.
+  - If it does not connect, it falls back to AP and `GET /` remains reachable at `http://192.168.4.1/`.
 
 ---
 

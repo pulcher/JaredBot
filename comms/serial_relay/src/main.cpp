@@ -1,6 +1,7 @@
 
 #include <Arduino.h>
 
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
 
@@ -8,18 +9,40 @@ static constexpr uint16_t kHttpPort = 80;
 static constexpr uint32_t kHelloIntervalMs = 2000;
 static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 
-// M4/M6 stepping stone: STA credentials are compile-time for now.
-// These will be replaced by persisted config in M5.
-static constexpr const char *kStaSsid = "";
-static constexpr const char *kStaPassword = "";
+static constexpr const char *kPrefsNamespace = "serial_relay";
+static constexpr const char *kPrefsStaSsidKey = "sta_ssid";
+static constexpr const char *kPrefsStaPassKey = "sta_pass";
 
 static WebServer server(kHttpPort);
+static Preferences prefs;
 
 static String apSsid;
 static bool wifiStaConnected = false;
 static IPAddress wifiStaIp;
 static uint32_t uart_rx_bytes = 0;
 static uint32_t uart_tx_bytes = 0;
+
+static String storedStaSsid;
+
+static bool loadStaCredentials(String &ssidOut, String &passOut)
+{
+	prefs.begin(kPrefsNamespace, true);
+	ssidOut = prefs.getString(kPrefsStaSsidKey, "");
+	passOut = prefs.getString(kPrefsStaPassKey, "");
+	prefs.end();
+
+	ssidOut.trim();
+	// Password may be empty for open networks.
+	return ssidOut.length() > 0;
+}
+
+static void saveStaCredentials(const String &ssid, const String &pass)
+{
+	prefs.begin(kPrefsNamespace, false);
+	prefs.putString(kPrefsStaSsidKey, ssid);
+	prefs.putString(kPrefsStaPassKey, pass);
+	prefs.end();
+}
 
 static String htmlEscape(const String &input)
 {
@@ -50,6 +73,7 @@ static void handleRoot()
 	body += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
 	body += "<title>serial_relay status</title></head><body>";
 	body += "<h1>serial_relay status</h1>";
+	body += "<p><a href='/config'>WiFi config</a></p>";
 	body += "<ul>";
 	body += "<li>WiFi mode: <code>" + String(wifiStaConnected ? "STA" : "AP") + "</code></li>";
 	if (wifiStaConnected)
@@ -76,6 +100,50 @@ static void handleNotFound()
 	server.send(404, "text/plain; charset=utf-8", "Not found\n");
 }
 
+static void handleConfigGet()
+{
+	String savedSsid;
+	String savedPass;
+	bool hasSaved = loadStaCredentials(savedSsid, savedPass);
+
+	String body;
+	body.reserve(800);
+	body += "<!doctype html><html><head><meta charset='utf-8'>";
+	body += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+	body += "<title>serial_relay WiFi config</title></head><body>";
+	body += "<h1>WiFi config</h1>";
+	body += "<p>Configure STA (connect to existing WiFi). On save, device will reboot.</p>";
+	body += "<form method='POST' action='/config'>";
+	body += "<label>SSID<br><input name='ssid' value='" + htmlEscape(hasSaved ? savedSsid : String("")) + "' maxlength='64' style='width: 100%; max-width: 360px;'></label><br><br>";
+	body += "<label>Password<br><input name='pass' type='password' value='' maxlength='64' style='width: 100%; max-width: 360px;'></label><br><br>";
+	body += "<button type='submit'>Save</button>";
+	body += "</form>";
+	body += "<p><a href='/'>Back to status</a></p>";
+	body += "</body></html>";
+
+	server.send(200, "text/html; charset=utf-8", body);
+}
+
+static void handleConfigPost()
+{
+	String ssid = server.arg("ssid");
+	String pass = server.arg("pass");
+	ssid.trim();
+
+	if (ssid.length() == 0)
+	{
+		server.send(400, "text/plain; charset=utf-8", "SSID is required\n");
+		return;
+	}
+
+	saveStaCredentials(ssid, pass);
+
+	server.send(200, "text/plain; charset=utf-8", "Saved. Rebooting...\n");
+	Serial.println("WiFi credentials saved; rebooting");
+	delay(500);
+	ESP.restart();
+}
+
 void setup()
 {
 	Serial.begin(115200);
@@ -84,15 +152,21 @@ void setup()
 	Serial.println();
 	Serial.println("serial_relay boot");
 
-	// M4 (tweaked): Try STA first, fall back to AP if STA fails.
+	// M4: Try STA first, fall back to AP if STA fails.
 	wifiStaConnected = false;
+	storedStaSsid = "";
 
-	if (strlen(kStaSsid) > 0)
+	String staSsid;
+	String staPass;
+	bool hasPrefsCreds = loadStaCredentials(staSsid, staPass);
+
+	if (hasPrefsCreds)
 	{
 		WiFi.mode(WIFI_STA);
-		WiFi.begin(kStaSsid, kStaPassword);
+		WiFi.begin(staSsid.c_str(), staPass.c_str());
 		Serial.print("STA connecting to SSID: ");
-		Serial.println(kStaSsid);
+		Serial.println(staSsid);
+		storedStaSsid = staSsid;
 
 		uint32_t startMs = millis();
 		while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startMs) < kStaConnectTimeoutMs)
@@ -118,33 +192,7 @@ void setup()
 	}
 	else
 	{
-		// If the ESP32 has previously stored STA credentials in flash, WiFi.begin()
-		// (with no args) will attempt to reconnect to them.
-		WiFi.mode(WIFI_STA);
-		WiFi.begin();
-		Serial.println("STA SSID not set; attempting saved STA credentials");
-
-		uint32_t startMs = millis();
-		while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startMs) < kStaConnectTimeoutMs)
-		{
-			delay(250);
-			Serial.print('.');
-		}
-		Serial.println();
-
-		wifiStaConnected = (WiFi.status() == WL_CONNECTED);
-		if (wifiStaConnected)
-		{
-			wifiStaIp = WiFi.localIP();
-			Serial.println("STA connected (saved credentials)");
-			Serial.print("STA IP: ");
-			Serial.println(wifiStaIp);
-		}
-		else
-		{
-			Serial.println("No saved STA connection; starting AP");
-			WiFi.disconnect(true, true);
-		}
+		Serial.println("No stored STA credentials; starting AP");
 	}
 
 	if (!wifiStaConnected)
@@ -166,6 +214,8 @@ void setup()
 		Serial.println(apIp);
 	}
 
+	server.on("/config", HTTP_GET, handleConfigGet);
+	server.on("/config", HTTP_POST, handleConfigPost);
 	server.on("/", HTTP_GET, handleRoot);
 	server.onNotFound(handleNotFound);
 	server.begin();
