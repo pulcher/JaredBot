@@ -146,16 +146,24 @@ Each milestone should be a clean commit point (even if you don’t commit, treat
 
 ---
 
-### M4 — AP + Status Webpage
+### M4 — STA Attempt (60s) + AP Fallback + Status Webpage
 
 **Implement**
-- Start SoftAP on boot.
+- On boot, attempt to connect to a local WiFi AP in STA mode for **at least 60 seconds**.
+  - If compile-time STA credentials are provided, try those.
+  - Otherwise, attempt to connect using any previously saved credentials (`WiFi.begin()` with no args).
+- If STA connect fails after the timeout, start SoftAP.
 - Start a minimal HTTP server with:
-  - `GET /` → status (AP IP, UART counters)
+  - `GET /` → status (WiFi mode + IP info, uptime, UART counters)
 
 **Acceptance**
-- Phone/laptop connects to AP.
-- Visiting `http://192.168.4.1/` shows a status page.
+- Device attempts STA for ~60 seconds before falling back.
+- If STA succeeds:
+  - Serial log prints `STA connected` and a `STA IP`.
+  - Visiting `http://<sta_ip>/` shows the status page with WiFi mode `STA`.
+- If STA fails:
+  - Serial log prints AP SSID/IP and the HTTP URL.
+  - Phone/laptop connects to AP and visiting `http://192.168.4.1/` (default) shows the status page with WiFi mode `AP`.
 
 ---
 
