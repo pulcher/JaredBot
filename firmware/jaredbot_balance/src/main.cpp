@@ -52,6 +52,9 @@ float pwm1 = 0, pwm2 = 0;
 unsigned long lastDebug = 0;     // 10 Hz Serial
 unsigned long lastCSV = 0;       // 50 Hz extSerial
 
+// Command buffer for ESP32
+String cmdBuffer = "";
+
 // Forward declarations
 void DSzhongduan();
 void angle_calculate(int16_t ax, int16_t ay, int16_t az,
@@ -108,6 +111,18 @@ void setup()
 void loop()
 {
     unsigned long now = millis();
+
+    // ----------- Receive commands from ESP32 -----------
+    while (extSerial.available()) {
+        char c = extSerial.read();
+        if (c == '\n') {
+            Serial.print("[ESP32] ");
+            Serial.println(cmdBuffer);
+            cmdBuffer = "";
+        } else if (c != '\r') {
+            cmdBuffer += c;
+        }
+    }
 
     // ----------- 10 Hz USB Serial Debug -----------
     if (now - lastDebug >= 100) {
