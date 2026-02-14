@@ -371,7 +371,7 @@ public sealed class Dashboard : Window
 
         _telemetry = new TelemetryState();
 
-        var hubUrl = "ws://192.168.1.88/ws";
+        var hubUrl = "ws://192.168.1.88:81/";
 
         _signalR = new SignalRListenerService(
             hubUrl,

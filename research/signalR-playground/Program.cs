@@ -16,7 +16,7 @@ namespace signalR_playground
 
         public static async Task Main(string[] args)
         {
-            var uriString = args.Length > 0 ? args[0] : "ws://192.168.1.88/ws";
+            var uriString = args.Length > 0 ? args[0] : "ws://192.168.1.88:81/";
 
             if (!Uri.TryCreate(uriString, UriKind.Absolute, out var uri) ||
                 (uri.Scheme != "ws" && uri.Scheme != "wss"))
