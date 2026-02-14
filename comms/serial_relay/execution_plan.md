@@ -20,7 +20,7 @@ The plan is organized into milestones you can build/upload/test independently.
 
 - Target: ESP32 DevKit v1, Arduino framework (PlatformIO env `esp32doit-devkit-v1`).
 - Entry point: `src/main.cpp`.
-- No library dependencies configured yet.
+- OLED (SSD1306 128x32, I2C) is now wired up using Adafruit SSD1306/GFX dependencies.
 
 ## 3) Locked SignalR Hub Route (Decision)
 
@@ -139,11 +139,12 @@ Each milestone should be a clean commit point (even if you don’t commit, treat
 - Add OLED library dependencies.
 - Initialize I2C + display.
 - Show a simple status screen:
-  - Boot OK
+  - WiFi mode + IP (shows STA IP when connected, otherwise AP IP)
   - UART RX/TX counters
 
 **Acceptance**
 - OLED renders reliably after power cycle.
+- OLED shows the current IP address.
 - Counters update when serial traffic occurs.
 
 ---

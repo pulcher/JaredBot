@@ -1,6 +1,11 @@
 
 #include <Arduino.h>
 
+#include <Wire.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -9,12 +14,21 @@ static constexpr uint16_t kHttpPort = 80;
 static constexpr uint32_t kHelloIntervalMs = 2000;
 static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 
+static constexpr uint32_t kOledRefreshIntervalMs = 500;
+
+static constexpr uint8_t kOledWidth = 128;
+static constexpr uint8_t kOledHeight = 32;
+static constexpr uint8_t kOledI2cAddress = 0x3C;
+
 static constexpr const char *kPrefsNamespace = "serial_relay";
 static constexpr const char *kPrefsStaSsidKey = "sta_ssid";
 static constexpr const char *kPrefsStaPassKey = "sta_pass";
 
 static WebServer server(kHttpPort);
 static Preferences prefs;
+
+static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
+static bool oledOk = false;
 
 static String apSsid;
 static bool wifiStaConnected = false;
@@ -23,6 +37,53 @@ static uint32_t uart_rx_bytes = 0;
 static uint32_t uart_tx_bytes = 0;
 
 static String storedStaSsid;
+
+static void oledRenderStatus()
+{
+	if (!oledOk)
+		return;
+
+	IPAddress ip = wifiStaConnected ? WiFi.localIP() : WiFi.softAPIP();
+
+	oled.clearDisplay();
+	oled.setTextSize(1);
+	oled.setTextColor(SSD1306_WHITE);
+
+	oled.setCursor(0, 0);
+	oled.print(wifiStaConnected ? "STA " : "AP  ");
+	oled.print(ip);
+
+	oled.setCursor(0, 12);
+	oled.print("RX ");
+	oled.print(uart_rx_bytes);
+
+	oled.setCursor(0, 22);
+	oled.print("TX ");
+	oled.print(uart_tx_bytes);
+
+	oled.display();
+}
+
+static void oledInit()
+{
+	Wire.begin();
+
+	if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress))
+	{
+		oledOk = false;
+		Serial.println("OLED init failed (SSD1306)");
+		return;
+	}
+
+	oledOk = true;
+	oled.clearDisplay();
+	oled.setTextSize(1);
+	oled.setTextColor(SSD1306_WHITE);
+	oled.setCursor(0, 0);
+	oled.println("serial_relay");
+	oled.println("Booting...");
+	oled.display();
+}
 
 static bool loadStaCredentials(String &ssidOut, String &passOut)
 {
@@ -152,6 +213,8 @@ void setup()
 	Serial.println();
 	Serial.println("serial_relay boot");
 
+	oledInit();
+
 	// M4: Try STA first, fall back to AP if STA fails.
 	wifiStaConnected = false;
 	storedStaSsid = "";
@@ -223,14 +286,23 @@ void setup()
 	Serial.print("HTTP server: http://");
 	Serial.print(wifiStaConnected ? wifiStaIp : WiFi.softAPIP());
 	Serial.println("/");
+
+	oledRenderStatus();
 }
 
 void loop()
 {
 	server.handleClient();
 
-	static uint32_t lastHelloMs = 0;
+	static uint32_t lastOledMs = 0;
 	uint32_t now = millis();
+	if ((uint32_t)(now - lastOledMs) >= kOledRefreshIntervalMs)
+	{
+		lastOledMs = now;
+		oledRenderStatus();
+	}
+
+	static uint32_t lastHelloMs = 0;
 	if ((uint32_t)(now - lastHelloMs) >= kHelloIntervalMs)
 	{
 		lastHelloMs = now;
