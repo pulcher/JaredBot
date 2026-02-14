@@ -33,6 +33,10 @@ The ESP32 hosts the endpoint other machines connect to.
 - Proposed port: **81** (keeps HTTP server on port 80)
 - Path: `/` (default)
 
+Example URLs:
+- If ESP32 is in AP mode: `ws://192.168.4.1:81/`
+- If ESP32 is on your LAN (STA mode): `ws://<sta_ip>:81/`
+
 ### Compatibility note (SignalR)
 
 Official ASP.NET Core SignalR clients (C#) cannot speak directly to an arbitrary WebSocket server without SignalR’s negotiate + framing protocol.
