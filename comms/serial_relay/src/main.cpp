@@ -11,7 +11,7 @@
 #include <WebServer.h>
 
 static constexpr uint16_t kHttpPort = 80;
-static constexpr uint32_t kHelloIntervalMs = 2000;
+static constexpr uint32_t kHeartbeatIntervalMs = 15000;
 static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 
 static constexpr uint32_t kOledRefreshIntervalMs = 500;
@@ -19,6 +19,13 @@ static constexpr uint32_t kOledRefreshIntervalMs = 500;
 static constexpr uint8_t kOledWidth = 128;
 static constexpr uint8_t kOledHeight = 32;
 static constexpr uint8_t kOledI2cAddress = 0x3C;
+
+// UART link to Arduino (newline-delimited text, logged to USB Serial).
+// Update these pins to match your wiring.
+static constexpr uint32_t kUnoUartBaud = 9600;
+static constexpr int kUnoUartRxPin = 16; // ESP32 RX (connect to Arduino TX via level shift)
+static constexpr int kUnoUartTxPin = 17; // ESP32 TX (connect to Arduino RX)
+static constexpr size_t kUnoLineMax = 192;
 
 static constexpr const char *kPrefsNamespace = "serial_relay";
 static constexpr const char *kPrefsStaSsidKey = "sta_ssid";
@@ -30,6 +37,8 @@ static Preferences prefs;
 static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
 static bool oledOk = false;
 
+static HardwareSerial unoSerial(2);
+
 static String apSsid;
 static bool wifiStaConnected = false;
 static IPAddress wifiStaIp;
@@ -37,6 +46,17 @@ static uint32_t uart_rx_bytes = 0;
 static uint32_t uart_tx_bytes = 0;
 
 static String storedStaSsid;
+
+static void unoSerialInit()
+{
+	unoSerial.begin(kUnoUartBaud, SERIAL_8N1, kUnoUartRxPin, kUnoUartTxPin);
+	Serial.print("UNO UART: Serial2 baud=");
+	Serial.print(kUnoUartBaud);
+	Serial.print(" RX=");
+	Serial.print(kUnoUartRxPin);
+	Serial.print(" TX=");
+	Serial.println(kUnoUartTxPin);
+}
 
 static void oledRenderStatus()
 {
@@ -214,6 +234,7 @@ void setup()
 	Serial.println("serial_relay boot");
 
 	oledInit();
+	unoSerialInit();
 
 	// M4: Try STA first, fall back to AP if STA fails.
 	wifiStaConnected = false;
@@ -294,6 +315,44 @@ void loop()
 {
 	server.handleClient();
 
+	// Read from Arduino UART and print complete lines to USB Serial.
+	static char unoLineBuf[kUnoLineMax];
+	static size_t unoLineLen = 0;
+	while (unoSerial.available() > 0)
+	{
+		int c = unoSerial.read();
+		if (c < 0)
+			break;
+
+		uart_rx_bytes++;
+		char ch = (char)c;
+
+		if (ch == '\r')
+			continue;
+
+		if (ch == '\n')
+		{
+			unoLineBuf[unoLineLen] = '\0';
+			if (unoLineLen > 0)
+			{
+				Serial.print("UNO> ");
+				Serial.println(unoLineBuf);
+			}
+			unoLineLen = 0;
+			continue;
+		}
+
+		if (unoLineLen < (kUnoLineMax - 1))
+		{
+			unoLineBuf[unoLineLen++] = ch;
+		}
+		else
+		{
+			unoLineLen = 0;
+			Serial.println("UNO> (line dropped: too long)");
+		}
+	}
+
 	static uint32_t lastOledMs = 0;
 	uint32_t now = millis();
 	if ((uint32_t)(now - lastOledMs) >= kOledRefreshIntervalMs)
@@ -303,10 +362,18 @@ void loop()
 	}
 
 	static uint32_t lastHelloMs = 0;
-	if ((uint32_t)(now - lastHelloMs) >= kHelloIntervalMs)
+	if ((uint32_t)(now - lastHelloMs) >= kHeartbeatIntervalMs)
 	{
 		lastHelloMs = now;
-		Serial.print("Hello, world! uptime_ms=");
-		Serial.println(now);
+		Serial.print("Heartbeat uptime_ms=");
+		Serial.print(now);
+		Serial.print(" wifi=");
+		Serial.print(wifiStaConnected ? "STA" : "AP");
+		Serial.print(" ip=");
+		Serial.print(wifiStaConnected ? WiFi.localIP() : WiFi.softAPIP());
+		Serial.print(" rx=");
+		Serial.print(uart_rx_bytes);
+		Serial.print(" tx=");
+		Serial.println(uart_tx_bytes);
 	}
 }
