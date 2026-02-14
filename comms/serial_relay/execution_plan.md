@@ -87,7 +87,29 @@ Subsystems:
 - **Shared ground** between ESP32 and Uno is required.
 - **Level shifting**: Uno TX is typically 5V; ESP32 RX is typically 3.3V tolerant only.
   - Add a level shifter or resistor divider on Uno→ESP32 line.
-- Pins are intentionally **not** locked in this plan yet (already wired in your setup). We will parameterize them later.
+
+## 5.1) Pin Map (Current Firmware Defaults)
+
+These are the pin assignments currently used by the ESP32 firmware in `src/main.cpp`. If your wiring differs, update the constants in the firmware.
+
+### OLED (SSD1306 128x32) — I2C
+
+- **SDA**: GPIO **21** (ESP32 default)
+- **SCL**: GPIO **22** (ESP32 default)
+- **I2C address**: **0x3C**
+
+Notes:
+- Many SSD1306 modules are `0x3C`, but some are `0x3D`.
+
+### Arduino Uno Link — ESP32 Serial2 (Hardware UART)
+
+- **Baud**: **9600**
+- **ESP32 RX2**: GPIO **16** (connect to **Uno TX** through level shift/divider)
+- **ESP32 TX2**: GPIO **17** (connect to **Uno RX**)
+
+Notes:
+- NeoSWSerial is an Uno-side requirement; on the ESP32 we intentionally use a hardware UART.
+- If you change pins, keep them on valid ESP32 GPIOs and update the `kUnoUartRxPin` / `kUnoUartTxPin` constants.
 
 ## 6) Milestones (Implementation + Acceptance Tests)
 
@@ -286,8 +308,88 @@ Important: “localhost” is never correct for the ESP32. If you’re running t
 
 ## 9) Deferred Decisions (Explicitly Not Locked Yet)
 
-- Exact ESP32 UART pins for the Uno link.
 - Exact Uno pins for NeoSWSerial.
-- OLED I2C address if it differs from the typical value in your module.
+- OLED I2C address **if** your module is `0x3D` instead of `0x3C`.
+- ESP32 UART/I2C pins **if** your wiring differs from the defaults documented above.
 
 These are intentionally left open because your hardware is already wired; we can add them as constants/config once you confirm the actual pin map.
+
+## 10) PCB Capture Checklist (KiCad-Friendly)
+
+If you think you’ll eventually spin a PCB, capturing the details below *now* (while the prototype works) saves a lot of rework later. KiCad cares most about **nets**, so the goal is to lock down a connector-oriented **pin map** and stable **net names**.
+
+Process rule for this repo: whenever we add a new hardware part or change wiring, we must update this section.
+
+### 10.1) Snapshot the Known Parts (Current Prototype)
+
+Parts currently in use in this project:
+
+- **ESP32 DevKit v1** (PlatformIO env: `esp32doit-devkit-v1`)
+- **Arduino Uno** (external firmware, NeoSWSerial required on Uno side)
+- **OLED**: SSD1306 128x32, I2C
+- **Level shifting** (required): Uno TX (5V) → ESP32 RX (3.3V)
+- **Power**: typically USB 5V into ESP32 DevKit (onboard 3.3V regulator)
+
+If your build uses additional items (buck regulator, battery, external sensor, enclosure), add them here as soon as they exist.
+
+### 10.2) Capture the Pin Map as Nets (Recommended Net Names)
+
+Use these net names consistently in documentation and later in the KiCad schematic:
+
+- `+5V`, `+3V3`, `GND`
+- `I2C_SDA`, `I2C_SCL`
+- `UART_UNO_TX_5V` (Uno TX before shifting), `UART_ESP_RX_3V3` (ESP RX after shifting)
+- `UART_ESP_TX_3V3` (ESP TX), `UART_UNO_RX_5V` (Uno RX)
+
+### 10.3) Known Pin Connections (as implemented in firmware defaults)
+
+These reflect the current defaults in `src/main.cpp` and typical ESP32 DevKit wiring.
+
+#### ESP32 DevKit v1 ↔ OLED (SSD1306, I2C)
+
+| Function | Net Name | ESP32 GPIO | OLED Pin (typical module) | Notes |
+|---|---:|---:|---|---|
+| I2C SDA | `I2C_SDA` | 21 | SDA | `Wire.begin()` defaults to 21/22 on ESP32 |
+| I2C SCL | `I2C_SCL` | 22 | SCL | |
+| Power | `+3V3` | 3V3 | VCC | Many OLED modules accept 3.3V; verify yours |
+| Ground | `GND` | GND | GND | |
+
+OLED module details to capture:
+- **I2C address**: default in firmware is `0x3C` (some modules are `0x3D`)
+- If the OLED module includes pull-ups, note the approximate pull-up value (commonly 4.7k–10k)
+
+#### ESP32 DevKit v1 ↔ Arduino Uno (UART link)
+
+| Function | Net Name | ESP32 GPIO | Uno Signal | Notes |
+|---|---:|---:|---|---|
+| ESP32 RX2 (Serial2 RX) | `UART_ESP_RX_3V3` | 16 | Uno TX (via shifter) | **Must** level shift Uno TX 5V → 3.3V |
+| ESP32 TX2 (Serial2 TX) | `UART_ESP_TX_3V3` | 17 | Uno RX | 3.3V is usually read as HIGH by Uno; verify if issues |
+| Ground | `GND` | GND | GND | Common ground required |
+
+UART details to capture:
+- **Baud**: 9600
+- **Framing**: 8N1
+- **Protocol**: newline-delimited UTF-8/ASCII text (for early milestones)
+
+#### Level Shifting (Uno TX → ESP32 RX)
+
+Capture which exact method you used (this matters for the PCB BOM):
+
+- **Resistor divider** (common/simple): `UART_UNO_TX_5V` → (R1) → `UART_ESP_RX_3V3` with (R2) to GND
+  - Record **R1/R2 values** you used (example: 2k/1k, 10k/20k, etc.)
+- **Level shifter IC** (more robust): record the exact IC part number and channel used
+
+### 10.4) Connector Decisions (What to Lock Down Early)
+
+For KiCad + PCB layout, it helps to decide how you want to physically connect everything:
+
+- OLED: 4-pin header (`GND`, `VCC`, `SCL`, `SDA`) — confirm pin order on your module
+- Uno link: 3-pin or 4-pin header (`GND`, `TX`, `RX`, optional `+5V` if you plan to power Uno)
+- Power input: USB only vs a dedicated connector (JST, barrel, screw terminal)
+
+### 10.5) Files/Formats That Convert Cleanly to KiCad
+
+- Keep the tables above up to date (Markdown is fine).
+- Optional but best: create a KiCad schematic early even if it’s “connectors + net labels only”.
+- If you want a quick-importable format later, maintain a simple CSV pin map with columns:
+  `Connector,PinNumber,NetName,Voltage,Direction,Notes`
