@@ -1,4 +1,4 @@
-# Execution Plan — ESP32 Serial Relay → SignalR
+# Execution Plan — ESP32 Serial Relay → WebSocket Relay (optional SignalR bridge)
 
 Date: 2026-02-09
 
@@ -11,7 +11,8 @@ Build an ESP32-based “serial relay” that:
   - **ESP32 side**: uses a **hardware UART** (recommended; NeoSWSerial is AVR-focused and not an ESP32 fit).
 - Connects to WiFi as a station (STA) when possible.
 - **Always** provides a fallback WiFi Access Point (AP) with a minimal configuration webpage (because upstream AP is not guaranteed).
-- Connects to an **ASP.NET Core SignalR** hub for monitoring/relay.
+- Hosts a **WebSocket-ish** endpoint so other machines can send commands and receive serial data.
+- (Optional) If you want official SignalR clients, run a small **PC bridge service** that exposes a SignalR hub and talks to the ESP32 over WebSockets.
 - Displays status on an SSD1306 OLED (128x32) via I2C.
 
 The plan is organized into milestones you can build/upload/test independently.
@@ -22,31 +23,24 @@ The plan is organized into milestones you can build/upload/test independently.
 - Entry point: `src/main.cpp`.
 - OLED (SSD1306 128x32, I2C) is now wired up using Adafruit SSD1306/GFX dependencies.
 
-## 3) Locked SignalR Hub Route (Decision)
+## 3) Device-Hosted WebSocket Endpoint (Decision)
 
-We will standardize the hub route to:
+The ESP32 hosts the endpoint other machines connect to.
 
-- **Hub route**: `/telemetryHub`
+### Primary transport
 
-The device will store only a **Server Origin** in configuration (scheme + host + optional port), e.g.:
+- **WebSocket server** hosted on the ESP32
+- Proposed port: **81** (keeps HTTP server on port 80)
+- Path: `/` (default)
 
-- `http://192.168.1.50:5000`
-- `http://192.168.4.2:5000` (when laptop is connected to the ESP32 AP)
+### Compatibility note (SignalR)
 
-The hub path `/telemetryHub` is not configurable (fixed).
+Official ASP.NET Core SignalR clients (C#) cannot speak directly to an arbitrary WebSocket server without SignalR’s negotiate + framing protocol.
 
-### Exact endpoints the ESP32 will use
+If you need official SignalR clients later, the recommended approach is:
 
-Given `server_origin`:
-
-- Negotiate: `${server_origin}/telemetryHub/negotiate?negotiateVersion=1`
-- WebSocket URL: derived from negotiate response (WebSockets transport)
-
-### SignalR JSON protocol reminders
-
-- Immediately after WebSocket connect, send the SignalR handshake frame:
-  - `{"protocol":"json","version":1}` followed by record separator byte `0x1e`.
-- Subsequent messages are JSON frames delimited by `0x1e`.
+- Run a small ASP.NET Core service on a PC/RPi that hosts a SignalR hub (e.g. `/telemetryHub`)
+- That service connects to the ESP32 via its WebSocket endpoint and bridges messages
 
 ## 4) Architecture (High Level)
 
@@ -63,7 +57,7 @@ Subsystems:
    - Line-delimited text for early milestones; binary framing can come later if needed.
 
 3. **OLED status (SSD1306 128x32 I2C)**
-   - Shows AP IP, STA IP (if any), hub status, UART counters/errors.
+  - Shows AP IP, STA IP (if any), UART counters/errors.
 
 4. **WiFi modes**
    - AP always enabled.
@@ -74,8 +68,10 @@ Subsystems:
   - `/` status page.
   - `/config` WiFi configuration page.
 
-6. **SignalR client**
-   - Negotiate → WebSocket connect → handshake → send/receive.
+6. **WebSocket server (device-hosted)**
+  - Accepts client connections.
+  - Broadcasts serial lines to clients.
+  - Receives client messages and forwards them to the Uno UART.
 
 ### Arduino Uno firmware (separate sketch)
 
@@ -234,23 +230,16 @@ Each milestone should be a clean commit point (even if you don’t commit, treat
 
 ---
 
-### M7 — SignalR Connect-Only (No Relay Yet)
+### M7 — WebSocket Server Bring-up (Device-Hosted)
 
 **Implement**
-- Add a WebSocket client and JSON parser.
-- Implement SignalR steps:
-  1. HTTP POST to `${server_origin}/telemetryHub/negotiate?negotiateVersion=1`
-  2. Parse negotiate response
-  3. Open WebSocket to the provided URL
-  4. Send SignalR handshake frame + `0x1e`
-  5. Receive loop: parse frames (initially just log them)
-- OLED shows hub status: connecting / connected / error.
+- Add a WebSocket **server** on the ESP32 (separate port from the HTTP server).
+- Log connect/disconnect and incoming text messages.
+- Keep firmware responsive (UART + OLED + HTTP must keep working).
 
 **Acceptance**
-- With hub running and reachable: device transitions to “connected”.
-- If hub is down: device retries with backoff; UART bridge and OLED remain responsive.
-
-Important: “localhost” is never correct for the ESP32. If you’re running the hub on your laptop while connected to the ESP32 AP, use the laptop’s AP-side IP (often `192.168.4.2`).
+- From a laptop/PC, you can connect to the ESP32 WebSocket endpoint and send/receive test messages.
+- UART + OLED + HTTP remain responsive while WebSocket clients connect.
 
 ---
 
@@ -258,15 +247,15 @@ Important: “localhost” is never correct for the ESP32. If you’re running t
 
 **Implement**
 - Keep the initial contract simple:
-  - Serial→Hub: each newline-delimited line becomes one hub invocation.
-  - Hub→Serial: a hub-to-device message becomes a line sent to Uno UART with `\n`.
+  - Serial→WebSocket clients: each newline-delimited serial line is broadcast as a WebSocket text message.
+  - WebSocket client→Serial: each received WebSocket text message is sent to the Uno UART with `\n` appended.
 - Add basic protections:
   - Max line length (drop + count if exceeded)
-  - Drop/queue policy when hub disconnected
+  - Drop/queue policy when no WebSocket clients are connected (initially: just drop)
 
 **Acceptance**
-- Uno-originated lines show up at the hub.
-- Hub-originated lines appear at the Uno.
+- Uno-originated lines show up at the WebSocket client.
+- Client-originated lines appear at the Uno.
 
 ---
 
@@ -277,14 +266,13 @@ Important: “localhost” is never correct for the ESP32. If you’re running t
   - UART read/write
   - OLED refresh (periodic)
   - WiFi state machine
-  - SignalR connection state machine
-- Reconnection/backoff for hub.
+  - WebSocket server loop
 - Add counters and last error string/enum.
 
 **Acceptance**
 - Recover without reboot when:
   - WiFi disappears and returns
-  - hub restarts
+  - a client disconnects/reconnects
   - Uno is unplugged/replugged
 - Device remains configurable via AP during failures.
 
@@ -302,9 +290,10 @@ Important: “localhost” is never correct for the ESP32. If you’re running t
   - Confirm baud matches on both sides.
   - Confirm common ground.
   - Confirm level shifting on Uno→ESP32.
-- If SignalR won’t connect:
-  - Verify `server_origin` is reachable from the ESP32’s current network.
-  - Don’t use `localhost`.
+- If WebSocket client won’t connect:
+  - Confirm you’re connecting to the ESP32’s current IP (STA IP or AP IP).
+  - If you’re connected to the ESP32 AP, the ESP32 is typically `192.168.4.1`.
+  - If you’re on LAN STA, use the printed STA IP.
 
 ## 9) Deferred Decisions (Explicitly Not Locked Yet)
 
@@ -340,7 +329,7 @@ Use these net names consistently in documentation and later in the KiCad schemat
 - `I2C_SDA`, `I2C_SCL`
 - `UART_UNO_TX_5V` (Uno TX before shifting), `UART_ESP_RX_3V3` (ESP RX after shifting)
 - `UART_ESP_TX_3V3` (ESP TX), `UART_UNO_RX_5V` (Uno RX)
-
+- If WebSocket client won’t connect:
 ### 10.3) Known Pin Connections (as implemented in firmware defaults)
 
 These reflect the current defaults in `src/main.cpp` and typical ESP32 DevKit wiring.

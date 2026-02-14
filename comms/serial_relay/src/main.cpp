@@ -10,7 +10,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+#include <WebSocketsServer.h>
+
 static constexpr uint16_t kHttpPort = 80;
+static constexpr uint16_t kWsPort = 81;
 static constexpr uint32_t kHeartbeatIntervalMs = 15000;
 static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 
@@ -34,6 +37,8 @@ static constexpr const char *kPrefsStaPassKey = "sta_pass";
 static WebServer server(kHttpPort);
 static Preferences prefs;
 
+static WebSocketsServer wsServer(kWsPort);
+
 static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
 static bool oledOk = false;
 
@@ -56,6 +61,48 @@ static void unoSerialInit()
 	Serial.print(kUnoUartRxPin);
 	Serial.print(" TX=");
 	Serial.println(kUnoUartTxPin);
+}
+
+static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t length)
+{
+	switch (type)
+	{
+	case WStype_CONNECTED:
+		Serial.print("WS client connected id=");
+		Serial.println(clientId);
+		break;
+	case WStype_DISCONNECTED:
+		Serial.print("WS client disconnected id=");
+		Serial.println(clientId);
+		break;
+	case WStype_TEXT:
+		// Treat incoming text as a line to forward to the Uno.
+		if (length == 0)
+			break;
+		if (length >= kUnoLineMax)
+		{
+			Serial.println("WS> (dropped: line too long)");
+			break;
+		}
+		{
+			char buf[kUnoLineMax];
+			memcpy(buf, payload, length);
+			buf[length] = '\0';
+			String line(buf);
+			line.trim();
+			if (line.length() == 0)
+				break;
+
+			Serial.print("WS> ");
+			Serial.println(line);
+			size_t written = unoSerial.print(line);
+			written += unoSerial.print('\n');
+			uart_tx_bytes += (uint32_t)written;
+		}
+		break;
+	default:
+		break;
+	}
 }
 
 static void oledRenderStatus()
@@ -304,8 +351,16 @@ void setup()
 	server.onNotFound(handleNotFound);
 	server.begin();
 
+	wsServer.begin();
+	wsServer.onEvent(wsOnEvent);
+
 	Serial.print("HTTP server: http://");
 	Serial.print(wifiStaConnected ? wifiStaIp : WiFi.softAPIP());
+	Serial.println("/");
+	Serial.print("WebSocket server: ws://");
+	Serial.print(wifiStaConnected ? wifiStaIp : WiFi.softAPIP());
+	Serial.print(":");
+	Serial.print(kWsPort);
 	Serial.println("/");
 
 	oledRenderStatus();
@@ -314,6 +369,7 @@ void setup()
 void loop()
 {
 	server.handleClient();
+	wsServer.loop();
 
 	// Read from Arduino UART and print complete lines to USB Serial.
 	static char unoLineBuf[kUnoLineMax];
@@ -337,6 +393,7 @@ void loop()
 			{
 				Serial.print("UNO> ");
 				Serial.println(unoLineBuf);
+				wsServer.broadcastTXT((uint8_t *)unoLineBuf, unoLineLen);
 			}
 			unoLineLen = 0;
 			continue;
