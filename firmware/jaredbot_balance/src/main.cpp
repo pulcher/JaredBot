@@ -116,8 +116,17 @@ void loop()
     while (extSerial.available()) {
         char c = extSerial.read();
         if (c == '\n') {
-            Serial.print("[ESP32] ");
-            Serial.println(cmdBuffer);
+            if (cmdBuffer.length() > 0) {
+                if (cmdBuffer.startsWith("C:")) {
+                    String command = cmdBuffer.substring(2);
+                    command.trim();
+                    Serial.print("[ESP32 CMD] ");
+                    Serial.println(command);
+                } else {
+                    Serial.print("[ESP32 INVALID] ");
+                    Serial.println(cmdBuffer);
+                }
+            }
             cmdBuffer = "";
         } else if (c != '\r') {
             cmdBuffer += c;
@@ -142,6 +151,7 @@ void loop()
         lastCSV = now;
 
         // CSV: angle,angle_speed,gyro_x,pd_pwm,pwm1,pwm2
+        extSerial.print("T:");
         extSerial.print(angle);
         extSerial.print(",");
         extSerial.print(angle_speed);
