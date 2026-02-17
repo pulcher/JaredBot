@@ -17,6 +17,8 @@ public sealed class Dashboard : Window
     private readonly TelemetryState _telemetry;
     private readonly SignalRListenerService _signalR;
 
+    private bool _didSyncInputsFromStatus;
+
     // Per-property views
     private readonly Label _rollValueLabel;
     private readonly Label _pitchValueLabel;
@@ -377,7 +379,8 @@ public sealed class Dashboard : Window
             hubUrl,
             message => LogViewer.AddMessage(message),
             _telemetry,
-            snapshot => Application.Invoke(() => UpdateTelemetryView(snapshot)));
+            snapshot => Application.Invoke(() => UpdateTelemetryView(snapshot)),
+            cfg => Application.Invoke(() => UpdateConfigView(cfg)));
 
         _ = _signalR.StartAsync();
     }
@@ -392,6 +395,27 @@ public sealed class Dashboard : Window
         _yawValueLabel.Text = F(snapshot.Yaw);
         _c1ValueLabel.Text = F(snapshot.Custom1);
         _c2ValueLabel.Text = F(snapshot.Custom2);
+    }
+
+    private void UpdateConfigView(ControlConfigSnapshot cfg)
+    {
+        static string F4(double? v) => v.HasValue ? v.Value.ToString("0.0000") : "—";
+        static string F3(double? v) => v.HasValue ? v.Value.ToString("0.000") : "—";
+
+        _setpointLabel.Text = F4(cfg.Setpoint);
+        _pidPLabel.Text = F3(cfg.Kp);
+        _pidILabel.Text = F3(cfg.Ki);
+        _pidDLabel.Text = F3(cfg.Kd);
+
+        if (!_didSyncInputsFromStatus)
+        {
+            if (cfg.Setpoint.HasValue) _setpointInput.Text = F4(cfg.Setpoint);
+            if (cfg.Kp.HasValue) _pidPInput.Text = F3(cfg.Kp);
+            if (cfg.Ki.HasValue) _pidIInput.Text = F3(cfg.Ki);
+            if (cfg.Kd.HasValue) _pidDInput.Text = F3(cfg.Kd);
+
+            _didSyncInputsFromStatus = true;
+        }
     }
 
     private void InitializeMenu()
