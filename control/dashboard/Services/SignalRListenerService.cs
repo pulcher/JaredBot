@@ -18,6 +18,9 @@ public sealed class SignalRListenerService : IAsyncDisposable
     private readonly Action<ControlConfigSnapshot>? _onConfig;
     private readonly CancellationTokenSource _cts = new();
 
+    private readonly object _wsLock = new();
+    private ClientWebSocket? _ws;
+
     // Backoff settings (same as playground)
     private const int MinBackoffMs = 500;
     private const int MaxBackoffMs = 30_000;
@@ -110,6 +113,11 @@ public sealed class SignalRListenerService : IAsyncDisposable
         using var ws = new ClientWebSocket();
         ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(0);
 
+        lock (_wsLock)
+        {
+            _ws = ws;
+        }
+
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         connectTimeout.CancelAfter(TimeSpan.FromSeconds(30));
 
@@ -162,6 +170,12 @@ public sealed class SignalRListenerService : IAsyncDisposable
         }
         finally
         {
+            lock (_wsLock)
+            {
+                if (ReferenceEquals(_ws, ws))
+                    _ws = null;
+            }
+
             if (ws.State == WebSocketState.Open)
             {
                 try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Client done", CancellationToken.None); }
@@ -170,6 +184,27 @@ public sealed class SignalRListenerService : IAsyncDisposable
         }
 
         return gotAnyData;
+    }
+
+    public Task SendCommandAsync(string commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+            return Task.CompletedTask;
+
+        ClientWebSocket? ws;
+        lock (_wsLock)
+        {
+            ws = _ws;
+        }
+
+        if (ws is null || ws.State != WebSocketState.Open)
+        {
+            _onMessage("[WS] Cannot send command: not connected.");
+            return Task.CompletedTask;
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(commandLine);
+        return ws.SendAsync(bytes, WebSocketMessageType.Text, true, _cts.Token);
     }
 
     private Task ProcessFrameAsync(WebSocketMessageType type, byte[] payload)

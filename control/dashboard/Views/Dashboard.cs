@@ -209,12 +209,18 @@ public sealed class Dashboard : Window
                     _setpointLabel.Text = value.ToString("0.000");
                     // later: send to SignalR hub
                     LogViewer.AddMessage($"[CFG] Setpoint updated to {value:0.000}");
+                    _ = SendConfigCommandFromInputsAsync();
                 }
                 else
                 {
                     LogViewer.AddMessage($"[CFG] Invalid setpoint: '{text}'");
                 }
             }
+        };
+
+        _setpointInput.Accepting += (s, e) =>
+        {
+            _ = SendConfigCommandFromInputsAsync();
         };
 
         setpointFrame.Add(_setpointLabel);
@@ -246,7 +252,7 @@ public sealed class Dashboard : Window
             X = 1,
             Y = 1,
             Width = 10,
-            TextAlignment = Alignment.End
+            TextAlignment = Alignment.End,
         };
 
         _pidPInput.KeyDown += (source, args) =>
@@ -258,12 +264,18 @@ public sealed class Dashboard : Window
                 {
                     _pidPLabel.Text = value.ToString("0.000");
                     LogViewer.AddMessage($"[CFG] PID P updated to {value:0.000}");
+                    _ = SendConfigCommandFromInputsAsync();
                 }
                 else
                 {
                     LogViewer.AddMessage($"[CFG] Invalid PID P: '{text}'");
                 }
             }
+        };
+
+        _pidPInput.Accepting += (s, e) =>
+        {
+            _ = SendConfigCommandFromInputsAsync();
         };
 
         pidPFrame.Add(_pidPLabel);
@@ -295,7 +307,7 @@ public sealed class Dashboard : Window
             X = 1,
             Y = 1,
             Width = 10,
-            TextAlignment = Alignment.End
+            TextAlignment = Alignment.End,
         };
 
         _pidIInput.KeyDown += (source, args) =>
@@ -307,12 +319,18 @@ public sealed class Dashboard : Window
                 {
                     _pidILabel.Text = value.ToString("0.000");
                     LogViewer.AddMessage($"[CFG] PID I updated to {value:0.000}");
+                    _ = SendConfigCommandFromInputsAsync();
                 }
                 else
                 {
                     LogViewer.AddMessage($"[CFG] Invalid PID I: '{text}'");
                 }
             }
+        };
+
+        _pidIInput.Accepting += (s, e) =>
+        {
+            _ = SendConfigCommandFromInputsAsync();
         };
 
         pidIFrame.Add(_pidILabel);
@@ -344,7 +362,7 @@ public sealed class Dashboard : Window
             X = 1,
             Y = 1,
             Width = 10,
-            TextAlignment = Alignment.End
+            TextAlignment = Alignment.End,
         };
 
         _pidDInput.KeyDown += (source, args) =>
@@ -356,12 +374,18 @@ public sealed class Dashboard : Window
                 {
                     _pidDLabel.Text = value.ToString("0.000");
                     LogViewer.AddMessage($"[CFG] PID D updated to {value:0.000}");
+                    _ = SendConfigCommandFromInputsAsync();
                 }
                 else
                 {
                     LogViewer.AddMessage($"[CFG] Invalid PID D: '{text}'");
                 }
             }
+        };
+
+        _pidDInput.Accepting += (s, e) =>
+        {
+            _ = SendConfigCommandFromInputsAsync();
         };
 
         pidDFrame.Add(_pidDLabel);
@@ -382,7 +406,69 @@ public sealed class Dashboard : Window
             snapshot => Application.Invoke(() => UpdateTelemetryView(snapshot)),
             cfg => Application.Invoke(() => UpdateConfigView(cfg)));
 
+        var inputs = new View[] { _setpointInput, _pidPInput, _pidIInput, _pidDInput };
+        foreach (var v in inputs)
+        {
+            v.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == KeyCode.Tab)
+                {
+                    FocusNextInput(inputs, v, forward: true);
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == (KeyCode.Tab | KeyCode.ShiftMask))
+                {
+                    FocusNextInput(inputs, v, forward: false);
+                    e.Handled = true;
+                }
+            };
+        }
+
         _ = _signalR.StartAsync();
+    }
+
+    private void FocusNextInput(View[] inputs, View current, bool forward)
+    {
+        if (inputs.Length == 0)
+            return;
+
+        var idx = Array.IndexOf(inputs, current);
+        if (idx < 0)
+            idx = 0;
+
+        var next = forward ? (idx + 1) % inputs.Length : (idx - 1 + inputs.Length) % inputs.Length;
+        inputs[next].SetFocus();
+    }
+
+    private Task SendConfigCommandFromInputsAsync()
+    {
+        static bool TryParseInvariant(string s, out double v)
+        {
+            return double.TryParse(
+                s,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out v);
+        }
+
+        static string Invariant(double v, int decimals) => v.ToString($"0.{new string('0', decimals)}", System.Globalization.CultureInfo.InvariantCulture);
+
+        var spText = _setpointInput.Text.ToString() ?? string.Empty;
+        var kpText = _pidPInput.Text.ToString() ?? string.Empty;
+        var kiText = _pidIInput.Text.ToString() ?? string.Empty;
+        var kdText = _pidDInput.Text.ToString() ?? string.Empty;
+
+        if (!TryParseInvariant(spText, out var sp) ||
+            !TryParseInvariant(kpText, out var kp) ||
+            !TryParseInvariant(kiText, out var ki) ||
+            !TryParseInvariant(kdText, out var kd))
+        {
+            return Task.CompletedTask;
+        }
+
+        var cmd = $"C:{Invariant(sp, 4)},{Invariant(kp, 3)},{Invariant(ki, 3)},{Invariant(kd, 3)}";
+        LogViewer.AddMessage($"[CFG] -> {cmd}");
+        return _signalR.SendCommandAsync(cmd);
     }
 
     private void UpdateTelemetryView(TelemetrySnapshot snapshot)

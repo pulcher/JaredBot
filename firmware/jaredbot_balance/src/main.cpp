@@ -51,12 +51,15 @@ float pwm1 = 0, pwm2 = 0;
 // Telemetry timers
 unsigned long lastDebug = 0;     // 10 Hz Serial
 unsigned long lastCSV = 0;       // 50 Hz extSerial
+unsigned long lastSettingsSent = 0;
+const unsigned long settingsIntervalMs = 20000;
 
 // Command buffer for ESP32
 String cmdBuffer = "";
 
 // Forward declarations
 void DSzhongduan();
+void sendSettingsRecord();
 void angle_calculate(int16_t ax, int16_t ay, int16_t az,
                      int16_t gx, int16_t gy, int16_t gz,
                      float dt, float Q_angle, float Q_gyro,
@@ -65,6 +68,21 @@ void Kalman_Filter(double angle_m, double gyro_m);
 void Yiorderfilter(float angle_m, float gyro_m);
 void PD();
 void anglePWM();
+
+void sendSettingsRecord()
+{
+    // Settings frame: S:<setpoint>,<kp>,<ki>,<kd>\n
+    // Setpoint is the calibrated trim value used by the controller (angle0)
+    extSerial.print("S:");
+    extSerial.print(angle0, 4);
+    extSerial.print(",");
+    extSerial.print(kp, 4);
+    extSerial.print(",");
+    extSerial.print(ki, 4);
+    extSerial.print(",");
+    extSerial.print(kd, 4);
+    extSerial.println();
+}
 
 // ---------------- SETUP ----------------
 void setup()
@@ -102,6 +120,10 @@ void setup()
     }
     angle0 = sum / 400.0;
 
+    // Send settings record once at startup (after calibration)
+    sendSettingsRecord();
+    lastSettingsSent = millis();
+
     // Timer2 ISR every 5ms
     MsTimer2::set(5, DSzhongduan);
     MsTimer2::start();
@@ -111,6 +133,12 @@ void setup()
 void loop()
 {
     unsigned long now = millis();
+
+    // ----------- Periodic settings record on extSerial -----------
+    if (now - lastSettingsSent >= settingsIntervalMs) {
+        sendSettingsRecord();
+        lastSettingsSent = now;
+    }
 
     // ----------- Receive commands from ESP32 -----------
     while (extSerial.available()) {
