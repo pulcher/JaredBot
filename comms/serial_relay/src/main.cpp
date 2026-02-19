@@ -52,6 +52,53 @@ static uint32_t uart_tx_bytes = 0;
 
 static String storedStaSsid;
 
+static void serialPrintEscaped(const uint8_t *data, size_t length, size_t maxLen)
+{
+	static constexpr char kHex[] = "0123456789ABCDEF";
+
+	size_t n = length;
+	if (n > maxLen)
+		n = maxLen;
+
+	for (size_t i = 0; i < n; i++)
+	{
+		uint8_t b = data[i];
+		switch (b)
+		{
+		case '\\':
+			Serial.print("\\\\");
+			break;
+		case '\r':
+			Serial.print("\\r");
+			break;
+		case '\n':
+			Serial.print("\\n");
+			break;
+		case '\t':
+			Serial.print("\\t");
+			break;
+		default:
+			if (b >= 0x20 && b <= 0x7E)
+			{
+				Serial.write((char)b);
+			}
+			else
+			{
+				char out[4] = {'\\', 'x', kHex[b >> 4], kHex[b & 0x0F]};
+				Serial.write((const uint8_t *)out, sizeof(out));
+			}
+			break;
+		}
+	}
+
+	if (length > maxLen)
+	{
+		Serial.print("... (truncated, total=");
+		Serial.print(length);
+		Serial.print(" bytes)");
+	}
+}
+
 static void unoSerialInit()
 {
 	unoSerial.begin(kUnoUartBaud, SERIAL_8N1, kUnoUartRxPin, kUnoUartTxPin);
@@ -76,29 +123,48 @@ static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t 
 		Serial.println(clientId);
 		break;
 	case WStype_TEXT:
-		// Treat incoming text as a line to forward to the Uno.
+	{
+		Serial.print("WS TEXT id=");
+		Serial.print(clientId);
+		Serial.print(" len=");
+		Serial.print(length);
+		Serial.print(" > ");
+		if (payload && length)
+			serialPrintEscaped(payload, length, 256);
+		Serial.println();
+
+		// Treat incoming text as a single line to forward to the Uno.
+		// Forward the payload exactly as received (no trimming), and ensure it is newline-terminated.
 		if (length == 0)
+			break;
+		if (!payload)
 			break;
 		if (length >= kUnoLineMax)
 		{
-			Serial.println("WS> (dropped: line too long)");
+			Serial.print("WS> (dropped: line too long len=");
+			Serial.print(length);
+			Serial.println(')');
 			break;
 		}
-		{
-			char buf[kUnoLineMax];
-			memcpy(buf, payload, length);
-			buf[length] = '\0';
-			String line(buf);
-			line.trim();
-			if (line.length() == 0)
-				break;
 
-			Serial.print("WS> ");
-			Serial.println(line);
-			size_t written = unoSerial.print(line);
-			written += unoSerial.print('\n');
-			uart_tx_bytes += (uint32_t)written;
-		}
+		Serial.print("WS> forwarding ");
+		Serial.print(length);
+		Serial.println(" bytes to UNO UART");
+		size_t written = unoSerial.write(payload, length);
+		if (payload[length - 1] != '\n')
+			written += unoSerial.write((uint8_t)'\n');
+		uart_tx_bytes += (uint32_t)written;
+		break;
+	}
+	case WStype_BIN:
+		Serial.print("WS BIN id=");
+		Serial.print(clientId);
+		Serial.print(" len=");
+		Serial.print(length);
+		Serial.print(" > ");
+		if (payload && length)
+			serialPrintEscaped(payload, length, 128);
+		Serial.println();
 		break;
 	default:
 		break;
@@ -391,8 +457,8 @@ void loop()
 			unoLineBuf[unoLineLen] = '\0';
 			if (unoLineLen > 0)
 			{
-				Serial.print("UNO> ");
-				Serial.println(unoLineBuf);
+				// Serial.print("UNO> ");
+				// Serial.println(unoLineBuf);
 				wsServer.broadcastTXT((uint8_t *)unoLineBuf, unoLineLen);
 			}
 			unoLineLen = 0;
