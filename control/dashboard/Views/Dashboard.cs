@@ -3,9 +3,12 @@ using Terminal.Gui.App;
 using Terminal.Gui.ViewBase;
 using Terminal.Gui.Views;
 using Terminal.Gui.Drawing;
+using System.Globalization;
+using dashboard;
 using dashboard.Models;
 using dashboard.Services;
 using Terminal.Gui.Drivers;
+using Terminal.Gui.Input;
 
 namespace dashboard.Views;
 
@@ -18,6 +21,9 @@ public sealed class Dashboard : Window
     private readonly SignalRListenerService _signalR;
 
     private bool _didSyncInputsFromStatus;
+    private ControlConfigSnapshot? _lastStatus;
+
+    private Label _logStatusLabel;
 
     // Per-property views
     private readonly Label _rollValueLabel;
@@ -47,6 +53,9 @@ public sealed class Dashboard : Window
 
     private readonly Label _kalmanNLabel;
     private readonly TextField _kalmanNInput;
+
+    private readonly Label _lastStatusValueLabel;
+    private readonly Label _lastCommandValueLabel;
 
     public Dashboard()
     {
@@ -392,6 +401,50 @@ public sealed class Dashboard : Window
         pidDFrame.Add(_pidDInput);
         Add(pidDFrame);
 
+        var statusFrame = new FrameView
+        {
+            Title = "Last Status (S:)",
+            X = 0,
+            Y = configY + 4,
+            Width = Dim.Percent(50),
+            Height = Dim.Absolute(3)
+        };
+
+        _lastStatusValueLabel = new Label
+        {
+            Text = "—",
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            TextAlignment = Alignment.Start
+        };
+
+        statusFrame.Add(_lastStatusValueLabel);
+        Add(statusFrame);
+
+        var commandFrame = new FrameView
+        {
+            Title = "Last Command (C:)",
+            X = Pos.Right(statusFrame),
+            Y = statusFrame.Y,
+            Width = Dim.Fill(),
+            Height = statusFrame.Height
+        };
+
+        _lastCommandValueLabel = new Label
+        {
+            Text = "—",
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            TextAlignment = Alignment.Start
+        };
+
+        commandFrame.Add(_lastCommandValueLabel);
+        Add(commandFrame);
+
         // Log view in the bottom portion
         InitializeLogView();
 
@@ -401,7 +454,11 @@ public sealed class Dashboard : Window
 
         _signalR = new SignalRListenerService(
             hubUrl,
-            message => LogViewer.AddMessage(message),
+            message => Application.Invoke(() =>
+            {
+                LogViewer.AddMessage(message);
+                UpdateLogStatusLabel();
+            }),
             _telemetry,
             snapshot => Application.Invoke(() => UpdateTelemetryView(snapshot)),
             cfg => Application.Invoke(() => UpdateConfigView(cfg)));
@@ -424,7 +481,7 @@ public sealed class Dashboard : Window
             };
         }
 
-        _ = _signalR.StartAsync();
+        _ = Task.Run(() => _signalR.StartAsync());
     }
 
     private void FocusNextInput(View[] inputs, View current, bool forward)
@@ -440,18 +497,16 @@ public sealed class Dashboard : Window
         inputs[next].SetFocus();
     }
 
-    private Task SendConfigCommandFromInputsAsync()
+    private async Task SendConfigCommandFromInputsAsync()
     {
-        static bool TryParseInvariant(string s, out double v)
+        static bool TryParseInvariant(string s, out float v)
         {
-            return double.TryParse(
+            return float.TryParse(
                 s,
                 System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture,
+                CultureInfo.InvariantCulture,
                 out v);
         }
-
-        static string Invariant(double v, int decimals) => v.ToString($"0.{new string('0', decimals)}", System.Globalization.CultureInfo.InvariantCulture);
 
         var spText = _setpointInput.Text.ToString() ?? string.Empty;
         var kpText = _pidPInput.Text.ToString() ?? string.Empty;
@@ -463,12 +518,38 @@ public sealed class Dashboard : Window
             !TryParseInvariant(kiText, out var ki) ||
             !TryParseInvariant(kdText, out var kd))
         {
-            return Task.CompletedTask;
+            return;
         }
 
-        var cmd = $"C:{Invariant(sp, 4)},{Invariant(kp, 3)},{Invariant(ki, 3)},{Invariant(kd, 3)}";
-        LogViewer.AddMessage($"[CFG] -> {cmd}");
-        return _signalR.SendCommandAsync(cmd);
+        // Prefer full SET if we've observed the extra KF values from the last S: status.
+        if (_lastStatus?.QAngle is double qa &&
+            _lastStatus?.QGyro is double qg &&
+            _lastStatus?.RAngle is double ra &&
+            _lastStatus?.K1 is double k1)
+        {
+            var cmd = JaredBotBalanceCommands.Set(
+                sp,
+                kp,
+                ki,
+                kd,
+                (float)qa,
+                (float)qg,
+                (float)ra,
+                (float)k1);
+
+            LogViewer.AddMessage($"[CFG] -> {cmd.TrimEnd('\n')}");
+            _lastCommandValueLabel.Text = cmd.TrimEnd('\n');
+            await _signalR.SendCommandAsync(cmd);
+            return;
+        }
+
+        // Fallback: send SP + PID as two commands.
+        var spCmd = JaredBotBalanceCommands.Sp(sp);
+        await _signalR.SendCommandAsync(spCmd);
+        var pidCmd = JaredBotBalanceCommands.Pid(kp, ki, kd);
+        LogViewer.AddMessage($"[CFG] -> {pidCmd.TrimEnd('\n')}");
+        _lastCommandValueLabel.Text = pidCmd.TrimEnd('\n');
+        await _signalR.SendCommandAsync(pidCmd);
     }
 
     private void UpdateTelemetryView(TelemetrySnapshot snapshot)
@@ -493,6 +574,9 @@ public sealed class Dashboard : Window
         _pidILabel.Text = F3(cfg.Ki);
         _pidDLabel.Text = F3(cfg.Kd);
 
+        _lastStatusValueLabel.Text = cfg.RawLine ?? "S:<missing>";
+        _lastStatus = cfg;
+
         if (!_didSyncInputsFromStatus)
         {
             if (cfg.Setpoint.HasValue) _setpointInput.Text = F4(cfg.Setpoint);
@@ -504,22 +588,48 @@ public sealed class Dashboard : Window
         }
     }
 
+    private void RequestReconnect()
+    {
+        ResetPanelsForReconnect();
+        LogViewer.AddMessage("[UI] Reconnect requested.");
+        _ = _signalR.ReconnectAsync();
+    }
+
+    private void ResetPanelsForReconnect()
+    {
+        _didSyncInputsFromStatus = false;
+        _lastStatus = null;
+
+        _rollValueLabel.Text = "—";
+        _pitchValueLabel.Text = "—";
+        _yawValueLabel.Text = "—";
+        _c1ValueLabel.Text = "—";
+        _c2ValueLabel.Text = "—";
+
+        _setpointLabel.Text = "—";
+        _pidPLabel.Text = "—";
+        _pidILabel.Text = "—";
+        _pidDLabel.Text = "—";
+
+        _lastStatusValueLabel.Text = "—";
+        _lastCommandValueLabel.Text = "—";
+    }
+
     private void InitializeMenu()
     {
         MenuBarV2 = new MenuBar(
         [
             new MenuBarItem("_File",
             [
-                new MenuItem("_New", "Create a new file", () => { }),
-                new MenuItem("_Open", "Open a file", () => { }),
-                new MenuItem("_Save", "Save the file", () => { }),
-                new MenuItem("_Quit", "Quit the application", () => Application.RequestStop())
+                new MenuItem("_Quit", "Quit the application", () => Application.RequestStop(), new Key(KeyCode.Q).WithCtrl)
             ]),
-            new MenuBarItem("_Edit",
+            new MenuBarItem("_Reconnect",
             [
-                new MenuItem("_Cut", "Cut selection", () => { }),
-                new MenuItem("_Copy", "Copy selection", () => { }),
-                new MenuItem("_Paste", "Paste clipboard", () => { })
+                new MenuItem("_Reconnect", "Reconnect websocket", () => RequestReconnect(), new Key(KeyCode.E).WithCtrl)
+            ]),
+            new MenuBarItem("_Log",
+            [
+                new MenuItem("_Toggle Log", "Show/hide log panel", () => ToggleLogPanel(), new Key(KeyCode.L).WithCtrl)
             ]),
             new MenuBarItem("_Help",
             [
@@ -543,10 +653,42 @@ public sealed class Dashboard : Window
             Height = 10,
             CanFocus = false,
             BorderStyle = LineStyle.Single,
-            Title = "Log"
+            Title = "Log",
+            Visible = false
+        };
+
+        LogViewer.VisibilityChanged += UpdateLogStatusLabel;
+
+        _logStatusLabel = new Label
+        {
+            Text = "Log: 0 msgs (Ctrl+L to show)",
+            X = 0,
+            Y = Pos.AnchorEnd(1),
+            Width = Dim.Fill(),
+            Height = 1,
+            TextAlignment = Alignment.Start
         };
 
         Add(LogViewer);
+        Add(_logStatusLabel);
+    }
+
+    private void UpdateLogStatusLabel()
+    {
+        var count = LogViewer.MessageCount;
+        if (LogViewer.LogVisible)
+        {
+            _logStatusLabel.Text = $"Log: {count} msgs (Ctrl+L to hide)";
+        }
+        else
+        {
+            _logStatusLabel.Text = $"Log: {count} msgs (Ctrl+L to show)";
+        }
+    }
+
+    private void ToggleLogPanel()
+    {
+        LogViewer.ToggleVisibility();
     }
 
     protected override void Dispose(bool disposing)

@@ -21,10 +21,10 @@ public sealed class SignalRListenerService : IAsyncDisposable
     private readonly object _wsLock = new();
     private ClientWebSocket? _ws;
 
-    // Backoff settings (same as playground)
-    private const int MinBackoffMs = 500;
-    private const int MaxBackoffMs = 30_000;
-    private const double BackoffFactor = 2.0;
+    private readonly object _reconnectLock = new();
+    private CancellationTokenSource _reconnectCts = new();
+
+    private const int ReconnectDelayMs = 500;
 
     public SignalRListenerService(
         string hubUrl,
@@ -50,30 +50,41 @@ public sealed class SignalRListenerService : IAsyncDisposable
     {
         _onMessage($"[WS] Connecting to {_uri} (press 'Q' in dashboard to quit).");
 
-        var backoffMs = MinBackoffMs;
-
         while (!_cts.IsCancellationRequested)
         {
+            CancellationTokenSource iterationCts;
+            lock (_reconnectLock)
+            {
+                iterationCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _reconnectCts.Token);
+            }
+
             var connected = false;
 
             try
             {
-                connected = await ConnectAndReceiveLoopAsync(_uri, _cts.Token);
+                connected = await ConnectAndReceiveLoopAsync(_uri, iterationCts.Token).ConfigureAwait(false);
                 if (connected)
                 {
                     // We had a successful session (connect + at least one receive or clean close)
-                    backoffMs = MinBackoffMs;
                 }
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
+                iterationCts.Dispose();
                 break;
+            }
+            catch (OperationCanceledException)
+            {
+                // Reconnect was requested — skip the delay and retry immediately.
+                _onMessage("[WS] Reconnect signal received, retrying now...");
+                iterationCts.Dispose();
+                continue;
             }
             catch (WebSocketException wex) when (wex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
             {
                 _onMessage("[WS] Connection closed prematurely by remote. Will retry.");
                 _onMessage($"[WS] WebSocketException: ErrorCode={wex.ErrorCode}, WebSocketErrorCode={wex.WebSocketErrorCode}");
-                backoffMs = await WaitWithBackoffAsync(backoffMs);
+                await WaitBeforeReconnectAsync(iterationCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -85,27 +96,29 @@ public sealed class SignalRListenerService : IAsyncDisposable
                 if (ex.InnerException is SocketException sex)
                     _onMessage($"[WS] SocketException: Code={sex.SocketErrorCode}, Message={sex.Message}");
 
-                backoffMs = await WaitWithBackoffAsync(backoffMs);
+                await WaitBeforeReconnectAsync(iterationCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                iterationCts.Dispose();
             }
         }
 
         _onMessage("[WS] Listener stopped.");
     }
 
-    private async Task<int> WaitWithBackoffAsync(int backoffMs)
+    private async Task WaitBeforeReconnectAsync(CancellationToken cancellation)
     {
-        _onMessage($"[WS] Reconnecting in {backoffMs}ms...");
+        _onMessage($"[WS] Reconnecting in {ReconnectDelayMs}ms...");
 
         try
         {
-            await Task.Delay(backoffMs, _cts.Token);
+            await Task.Delay(ReconnectDelayMs, cancellation).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            return backoffMs;
+            return;
         }
-
-        return Math.Min(MaxBackoffMs, (int)(backoffMs * BackoffFactor));
     }
 
     private async Task<bool> ConnectAndReceiveLoopAsync(Uri uri, CancellationToken cancellation)
@@ -121,7 +134,7 @@ public sealed class SignalRListenerService : IAsyncDisposable
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         connectTimeout.CancelAfter(TimeSpan.FromSeconds(30));
 
-        await ws.ConnectAsync(uri, connectTimeout.Token);
+        await ws.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
         _onMessage("[WS] Connected. Receiving frames until shutdown or remote close...");
 
         var buffer = new byte[16 * 1024];
@@ -138,12 +151,13 @@ public sealed class SignalRListenerService : IAsyncDisposable
                 {
                     do
                     {
-                        result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellation);
+                        result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellation).ConfigureAwait(false);
 
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
                             _onMessage($"[WS] Server sent close: {result.CloseStatus} - {result.CloseStatusDescription}");
-                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client ack", CancellationToken.None);
+                            using var closeAckTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client ack", closeAckTimeout.Token).ConfigureAwait(false);
                             return gotAnyData;
                         }
 
@@ -165,7 +179,7 @@ public sealed class SignalRListenerService : IAsyncDisposable
                     break;
                 }
 
-                await ProcessFrameAsync(result.MessageType, ms.ToArray());
+                await ProcessFrameAsync(result.MessageType, ms.ToArray()).ConfigureAwait(false);
             }
         }
         finally
@@ -178,7 +192,11 @@ public sealed class SignalRListenerService : IAsyncDisposable
 
             if (ws.State == WebSocketState.Open)
             {
-                try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Client done", CancellationToken.None); }
+                try
+                {
+                    using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Client done", closeTimeout.Token).ConfigureAwait(false);
+                }
                 catch { }
             }
         }
@@ -207,12 +225,59 @@ public sealed class SignalRListenerService : IAsyncDisposable
         return ws.SendAsync(bytes, WebSocketMessageType.Text, true, _cts.Token);
     }
 
+    public void SendCommand(string commandLine)
+    {
+        _ = SendCommandAsync(commandLine);
+    }
+
+    public async Task ReconnectAsync()
+    {
+     _onMessage("[WS] Reconnect requested.");
+
+        // Signal the current iteration to cancel (interrupts delay or ConnectAsync).
+        lock (_reconnectLock)
+        {
+            _reconnectCts.Cancel();
+            _reconnectCts.Dispose();
+            _reconnectCts = new CancellationTokenSource();
+        }
+
+        // Also abort the current websocket if one exists.
+        ClientWebSocket? ws;
+        lock (_wsLock)
+        {
+            ws = _ws;
+        }
+
+        if (ws is null)
+            return;
+
+        try
+        {
+            ws.Abort();
+        }
+        catch
+        {
+        }
+    }
+
+    public void Reconnect()
+    {
+        _ = ReconnectAsync();
+    }
+
     private Task ProcessFrameAsync(WebSocketMessageType type, byte[] payload)
     {
         if (type == WebSocketMessageType.Text)
         {
             var text = SafeUtf8(payload);
             _onMessage(text);
+
+            if (text.Equals("A:OK", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("A:ERR", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.CompletedTask;
+            }
 
             if (text.StartsWith("T:", StringComparison.OrdinalIgnoreCase))
             {
@@ -313,7 +378,11 @@ public sealed class SignalRListenerService : IAsyncDisposable
             Setpoint = TryParse(parts[0]),
             Kp = TryParse(parts[1]),
             Ki = TryParse(parts[2]),
-            Kd = TryParse(parts[3])
+            Kd = TryParse(parts[3]),
+            QAngle = parts.Length > 4 ? TryParse(parts[4]) : null,
+            QGyro = parts.Length > 5 ? TryParse(parts[5]) : null,
+            RAngle = parts.Length > 6 ? TryParse(parts[6]) : null,
+            K1 = parts.Length > 7 ? TryParse(parts[7]) : null
         };
     }
 
@@ -345,6 +414,11 @@ public sealed class SignalRListenerService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         try { _cts.Cancel(); } catch { }
+        lock (_reconnectLock)
+        {
+            try { _reconnectCts.Cancel(); } catch { }
+            _reconnectCts.Dispose();
+        }
         _cts.Dispose();
         await Task.CompletedTask;
     }
