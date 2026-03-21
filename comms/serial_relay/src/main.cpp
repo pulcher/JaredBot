@@ -1,15 +1,12 @@
 
 #include <Arduino.h>
-
 #include <Wire.h>
-
+#include <WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 #include <Preferences.h>
-#include <WiFi.h>
 #include <WebServer.h>
-
 #include <WebSocketsServer.h>
 
 static constexpr uint16_t kHttpPort = 80;
@@ -20,8 +17,18 @@ static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 static constexpr uint32_t kOledRefreshIntervalMs = 500;
 
 static constexpr uint8_t kOledWidth = 128;
-static constexpr uint8_t kOledHeight = 32;
+static constexpr uint8_t kOledHeight = 64;
+// I2C pins for ESP32-C3 0.42" OLED boards (check your board's datasheet)
+static constexpr uint8_t kOledSda = 5;
+static constexpr uint8_t kOledScl = 6;
+static constexpr uint8_t kOledReset = -1; // Not connected; using I2C, so shared reset is likely.
 static constexpr uint8_t kOledI2cAddress = 0x3C;
+
+// Debug switch: disable the UNO UART (Serial2) without removing code.
+// Set to 1 to enable Serial2 init/read/write.
+#ifndef ENABLE_UNO_UART
+#define ENABLE_UNO_UART 0
+#endif
 
 // UART link to Arduino (newline-delimited text, logged to USB Serial).
 // Update these pins to match your wiring.
@@ -39,7 +46,7 @@ static Preferences prefs;
 
 static WebSocketsServer wsServer(kWsPort);
 
-static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, -1);
+static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, kOledReset);
 static bool oledOk = false;
 
 static HardwareSerial unoSerial(2);
@@ -147,6 +154,7 @@ static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t 
 			break;
 		}
 
+		#if ENABLE_UNO_UART
 		Serial.print("WS> forwarding ");
 		Serial.print(length);
 		Serial.println(" bytes to UNO UART");
@@ -154,6 +162,9 @@ static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t 
 		if (payload[length - 1] != '\n')
 			written += unoSerial.write((uint8_t)'\n');
 		uart_tx_bytes += (uint32_t)written;
+		#else
+		Serial.println("WS> UNO UART disabled; not forwarding");
+		#endif
 		break;
 	}
 	case WStype_BIN:
@@ -199,7 +210,8 @@ static void oledRenderStatus()
 
 static void oledInit()
 {
-	Wire.begin();
+	// Initialize I2C with custom pins
+    Wire.begin(kOledSda, kOledScl);
 
 	if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress))
 	{
@@ -210,8 +222,9 @@ static void oledInit()
 
 	oledOk = true;
 	oled.clearDisplay();
+	oled.fillScreen(SSD1306_WHITE);
 	oled.setTextSize(1);
-	oled.setTextColor(SSD1306_WHITE);
+	oled.setTextColor(SSD1306_BLACK);
 	oled.setCursor(0, 0);
 	oled.println("serial_relay");
 	oled.println("Booting...");
@@ -341,13 +354,17 @@ static void handleConfigPost()
 void setup()
 {
 	Serial.begin(115200);
-	delay(250);
+	delay(5000);
 
 	Serial.println();
 	Serial.println("serial_relay boot");
 
 	oledInit();
+	#if ENABLE_UNO_UART
 	unoSerialInit();
+	#else
+	Serial.println("UNO UART disabled (ENABLE_UNO_UART=0)");
+	#endif
 
 	// M4: Try STA first, fall back to AP if STA fails.
 	wifiStaConnected = false;
@@ -437,6 +454,7 @@ void loop()
 	server.handleClient();
 	wsServer.loop();
 
+	#if ENABLE_UNO_UART
 	// Read from Arduino UART and print complete lines to USB Serial.
 	static char unoLineBuf[kUnoLineMax];
 	static size_t unoLineLen = 0;
@@ -475,6 +493,7 @@ void loop()
 			Serial.println("UNO> (line dropped: too long)");
 		}
 	}
+	#endif
 
 	static uint32_t lastOledMs = 0;
 	uint32_t now = millis();
@@ -497,6 +516,9 @@ void loop()
 		Serial.print(" rx=");
 		Serial.print(uart_rx_bytes);
 		Serial.print(" tx=");
-		Serial.println(uart_tx_bytes);
+		Serial.print(uart_tx_bytes);
+		Serial.print(" display connected= ");
+		Serial.print(oledOk ? "YES" : "NO");
+		Serial.println();
 	}
 }
