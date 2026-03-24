@@ -7,7 +7,16 @@
 
 #include <Preferences.h>
 #include <WebServer.h>
+
+// Debug/feature switch: disable WebSockets without removing code.
+// Set to 1 to enable WebSockets server compile + runtime.
+#ifndef ENABLE_WEBSOCKETS
+#define ENABLE_WEBSOCKETS 0
+#endif
+
+#if ENABLE_WEBSOCKETS
 #include <WebSocketsServer.h>
+#endif
 
 static constexpr uint16_t kHttpPort = 80;
 static constexpr uint16_t kWsPort = 81;
@@ -44,7 +53,9 @@ static constexpr const char *kPrefsStaPassKey = "sta_pass";
 static WebServer server(kHttpPort);
 static Preferences prefs;
 
+#if ENABLE_WEBSOCKETS
 static WebSocketsServer wsServer(kWsPort);
+#endif
 
 static Adafruit_SSD1306 oled(kOledWidth, kOledHeight, &Wire, kOledReset);
 static bool oledOk = false;
@@ -117,6 +128,7 @@ static void unoSerialInit()
 	Serial.println(kUnoUartTxPin);
 }
 
+#if ENABLE_WEBSOCKETS
 static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t length)
 {
 	switch (type)
@@ -181,6 +193,7 @@ static void wsOnEvent(uint8_t clientId, WStype_t type, uint8_t *payload, size_t 
 		break;
 	}
 }
+#endif
 
 static void oledRenderStatus()
 {
@@ -213,7 +226,7 @@ static void oledInit()
 	// Initialize I2C with custom pins
     Wire.begin(kOledSda, kOledScl);
 
-	if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress))
+	if (!oled.begin(SSD1306_SWITCHCAPVCC, kOledI2cAddress /*0x3D*/))
 	{
 		oledOk = false;
 		Serial.println("OLED init failed (SSD1306)");
@@ -222,9 +235,9 @@ static void oledInit()
 
 	oledOk = true;
 	oled.clearDisplay();
-	oled.fillScreen(SSD1306_WHITE);
+    // oled.fillScreen(SSD1306_WHITE);
 	oled.setTextSize(1);
-	oled.setTextColor(SSD1306_BLACK);
+	oled.setTextColor(SSD1306_WHITE);
 	oled.setCursor(0, 0);
 	oled.println("serial_relay");
 	oled.println("Booting...");
@@ -434,17 +447,23 @@ void setup()
 	server.onNotFound(handleNotFound);
 	server.begin();
 
+	#if ENABLE_WEBSOCKETS
 	wsServer.begin();
 	wsServer.onEvent(wsOnEvent);
+	#endif
 
 	Serial.print("HTTP server: http://");
 	Serial.print(wifiStaConnected ? wifiStaIp : WiFi.softAPIP());
 	Serial.println("/");
+	#if ENABLE_WEBSOCKETS
 	Serial.print("WebSocket server: ws://");
 	Serial.print(wifiStaConnected ? wifiStaIp : WiFi.softAPIP());
 	Serial.print(":");
 	Serial.print(kWsPort);
 	Serial.println("/");
+	#else
+	Serial.println("WebSocket server disabled (ENABLE_WEBSOCKETS=0)");
+	#endif
 
 	oledRenderStatus();
 }
@@ -452,7 +471,9 @@ void setup()
 void loop()
 {
 	server.handleClient();
+	#if ENABLE_WEBSOCKETS
 	wsServer.loop();
+	#endif
 
 	#if ENABLE_UNO_UART
 	// Read from Arduino UART and print complete lines to USB Serial.
@@ -477,7 +498,9 @@ void loop()
 			{
 				// Serial.print("UNO> ");
 				// Serial.println(unoLineBuf);
+				#if ENABLE_WEBSOCKETS
 				wsServer.broadcastTXT((uint8_t *)unoLineBuf, unoLineLen);
+				#endif
 			}
 			unoLineLen = 0;
 			continue;
