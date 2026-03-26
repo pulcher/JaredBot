@@ -25,8 +25,8 @@ static constexpr uint32_t kStaConnectTimeoutMs = 60000;
 
 static constexpr uint32_t kOledRefreshIntervalMs = 500;
 
-static constexpr uint8_t kOledWidth = 128;
-static constexpr uint8_t kOledHeight = 64;
+static constexpr uint8_t kOledWidth = 70;
+static constexpr uint8_t kOledHeight = 42;
 // I2C pins for ESP32-C3 0.42" OLED boards (check your board's datasheet)
 static constexpr uint8_t kOledSda = 5;
 static constexpr uint8_t kOledScl = 6;
