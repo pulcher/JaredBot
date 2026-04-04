@@ -28,7 +28,7 @@ static constexpr uint32_t kOledRefreshIntervalMs = 500;
 // stop (no WiFi/server/etc). This ensures the calibration screen can't be
 // overwritten by later rendering.
 #ifndef OLED_CALIBRATION_MODE
-#define OLED_CALIBRATION_MODE 1
+#define OLED_CALIBRATION_MODE 0
 #endif
 
 // OLED display width and height (0.42" OLEDs on ESP32-C3 SuperMini are commonly 72x40)
@@ -238,24 +238,42 @@ static void oledRenderStatus()
 	if (!oledOk)
 		return;
 
+	const int16_t originX = OLED_X_OFFSET;
+	const int16_t originY = OLED_Y_OFFSET;
+
 	IPAddress ip = wifiStaConnected ? WiFi.localIP() : WiFi.softAPIP();
 
 	display.clearBuffer();
+	display.setDrawColor(1);
 	display.setFont(u8g2_font_6x10_tf);
+	display.setFontPosTop();
 
-	// Baseline Y coordinates for 6x10 font.
-	const uint8_t line1Y = 10;
-	const uint8_t line2Y = 22;
-	const uint8_t line3Y = 34;
+	// Top-aligned Y coordinates for 6x10 font.
+	const uint8_t line1Y = 0;
+	const uint8_t line2Y = 12;
+	const uint8_t line3Y = 24;
 
-	display.setCursor(0, line1Y);
+	display.setCursor(originX + 0, originY + line1Y);
 	display.print(wifiStaConnected ? "STA" : "AP");
 
-	display.setCursor(0, line2Y);
-	display.print(ip);
+	// Fit IP string to the screen width (72px at 6px/char => 12 chars).
+	String ipStr = ip.toString();
+	const size_t maxChars = (size_t)(SCREEN_WIDTH / 6);
+	while (ipStr.length() > maxChars)
+	{
+		int dot = ipStr.indexOf('.');
+		if (dot < 0)
+			break;
+		ipStr = ipStr.substring((size_t)dot + 1);
+	}
+	if (ipStr.length() > maxChars)
+		ipStr = ipStr.substring(ipStr.length() - (int)maxChars);
+
+	display.setCursor(originX + 0, originY + line2Y);
+	display.print(ipStr);
 
 	// Compact counters on the last line.
-	// oled.setCursor(0, line3Y);
+	// oled.setCursor(originX + 0, originY + line3Y);
 	// oled.print("R");
 	// oled.print(uart_rx_bytes);
 	// oled.print(" T");
@@ -304,15 +322,20 @@ static void oledInit()
 	display.drawHLine(originX + 0, originY + SCREEN_HEIGHT - 1, SCREEN_WIDTH);
 
 	display.setFont(u8g2_font_6x10_tf);
+	display.setFontPosTop();
+
+	// Text origin inside the border (avoid drawing under the thick border).
+	const int16_t textOriginX = originX + 2;
+	const int16_t textOriginY = originY + 1;
 
 	// Corner/edge labels (help identify which edges are off-screen)
-	display.setCursor(originX + 2, originY + 12);
+	display.setCursor(textOriginX + 0, textOriginY + 0);
 	display.print('L');
-	display.setCursor(originX + SCREEN_WIDTH - 8, originY + 12);
+	display.setCursor(originX + SCREEN_WIDTH - 8, textOriginY + 0);
 	display.print('R');
-	display.setCursor(originX + (SCREEN_WIDTH / 2) - 3, originY + 10);
+	display.setCursor(originX + (SCREEN_WIDTH / 2) - 3, originY + 0);
 	display.print('T');
-	display.setCursor(originX + (SCREEN_WIDTH / 2) - 3, originY + SCREEN_HEIGHT - 2);
+	display.setCursor(originX + (SCREEN_WIDTH / 2) - 3, originY + SCREEN_HEIGHT - 10);
 	display.print('B');
 
 	// Origin crosshair at (0,0) in our logical buffer
@@ -331,7 +354,8 @@ static void oledInit()
 	for (int16_t y = 0; y < SCREEN_HEIGHT; y += 16)
 		display.drawHLine(originX + 0, originY + y, SCREEN_WIDTH);
 
-	display.setCursor(originX + 14, originY + 10);
+	// Geometry/offset readout (kept away from animation and borders).
+	display.setCursor(textOriginX + 12, textOriginY + 10);
 	display.print(SCREEN_WIDTH);
 	display.print('x');
 	display.print(SCREEN_HEIGHT);
@@ -340,38 +364,31 @@ static void oledInit()
 	display.print(" Y");
 	display.print(OLED_Y_OFFSET);
 
-	// Fill the entire screen with a repeating 0-9 pattern.
-	// This is a quick way to validate the effective pixel size, margins, and font spacing.
-	const int16_t cols = SCREEN_WIDTH / 6;
+	// Fill the screen with a repeating 0-9 pattern.
+	// Start below the geometry line so we can always see some known text.
+	const int16_t cols = (SCREEN_WIDTH - 2) / 6;
 	const int16_t rows = SCREEN_HEIGHT / 10;
+	const int16_t digitsStartY = textOriginY + 20;
 	for (int16_t r = 0; r < rows; r++)
 	{
-		display.setCursor(OLED_X_OFFSET, OLED_Y_OFFSET + 8 + r * 10);
+		int16_t y = digitsStartY + r * 10;
+		if (y > (originY + SCREEN_HEIGHT - 10))
+			break;
 
-		// First character: line number (wraps 0..9)
+		display.setCursor(textOriginX, y);
+
+		// First character: row number (wraps 0..9)
 		display.print((char)('0' + (r % 10)));
 
 		// Remaining: 0..9 repeating to the end of the line
 		for (int16_t c = 1; c < cols; c++)
-		{
 			display.print((char)('0' + ((c - 1) % 10)));
-		}
 	}
 
 	display.sendBuffer();
 
-	// Simple animation marker (moves across top row) so it's obvious when the
-	// device reboots and the OLED is updating.
-	for (int16_t x = 1; x < (int16_t)SCREEN_WIDTH - 2; x += 4)
-	{
-		display.setDrawColor(0);
-		display.drawBox(1, 9, SCREEN_WIDTH - 2, 3);
-		display.setDrawColor(1);
-		display.drawBox(x, 9, 3, 3);
-		display.sendBuffer();
-		delay(kOledCalibAnimMs);
-	}
-	display.sendBuffer();
+	// NOTE: Intentionally no animation here. The calibration screen is meant to
+	// be static and predictable so text can't be erased by later drawing.
 }
 
 static bool loadStaCredentials(String &ssidOut, String &passOut)
