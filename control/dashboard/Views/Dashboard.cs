@@ -450,7 +450,7 @@ public sealed class Dashboard : Window
 
         _telemetry = new TelemetryState();
 
-        var hubUrl = "ws://192.168.1.88:81/";
+        var hubUrl = "ws://192.168.1.73:81/";
 
         _signalR = new SignalRListenerService(
             hubUrl,
@@ -697,8 +697,10 @@ public sealed class Dashboard : Window
         {
             if (_signalR is not null)
             {
-                _ = _signalR.DisposeAsync();
+                _signalR.DisposeAsync().AsTask().GetAwaiter().GetResult();
             }
+
+            LogViewer.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
 
         base.Dispose(disposing);

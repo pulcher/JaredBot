@@ -10,7 +10,7 @@
 // Debug/feature switch: disable WebSockets without removing code.
 // Set to 1 to enable WebSockets server compile + runtime.
 #ifndef ENABLE_WEBSOCKETS
-#define ENABLE_WEBSOCKETS 0
+#define ENABLE_WEBSOCKETS 1
 #endif
 
 #if ENABLE_WEBSOCKETS
@@ -60,8 +60,8 @@ static constexpr uint16_t kOledCalibAnimMs = 150;
 // UART link to Arduino (newline-delimited text, logged to USB Serial).
 // Update these pins to match your wiring.
 static constexpr uint32_t kUnoUartBaud = 9600;
-static constexpr int kUnoUartRxPin = 16; // ESP32 RX (connect to Arduino TX via level shift)
-static constexpr int kUnoUartTxPin = 17; // ESP32 TX (connect to Arduino RX)
+static constexpr int kUnoUartRxPin = 20; // ESP32 RX (connect to Arduino TX via level shift)
+static constexpr int kUnoUartTxPin = 21; // ESP32 TX (connect to Arduino RX)
 static constexpr size_t kUnoLineMax = 192;
 
 static constexpr const char *kPrefsNamespace = "serial_relay";
@@ -77,7 +77,7 @@ static WebSocketsServer wsServer(kWsPort);
 
 static bool oledOk = false;
 
-static HardwareSerial unoSerial(2);
+static HardwareSerial unoSerial(1);
 
 static String apSsid;
 static bool wifiStaConnected = false;
@@ -514,7 +514,7 @@ static void handleConfigPost()
 void setup()
 {
 	Serial.begin(115200);
-	delay(5000);
+	delay(10000);
 
 	Serial.println();
 	Serial.println("serial_relay boot");

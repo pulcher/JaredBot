@@ -19,6 +19,50 @@ const int left_L1 = 7;
 const int left_L2 = 6;
 const int PWM_L = 9;
 
+// ---------------- ENCODERS ----------------
+// Keyestudio KS0193 kit wiring (per official docs):
+//   Right motor Hall encoder pulse -> D4
+//   Left  motor Hall encoder pulse -> D5
+// These are single-channel pulse outputs (not full quadrature), so we count rising edges.
+// If the connector orientation flips left/right, swap the pin constants.
+static const uint8_t ENC_RIGHT_PIN = 4; // D4
+static const uint8_t ENC_LEFT_PIN  = 5; // D5
+
+static const bool ENC_RIGHT_INVERT = false;
+static const bool ENC_LEFT_INVERT  = false;
+
+volatile long encRightCount = 0;
+volatile long encLeftCount = 0;
+static uint8_t encLastPortD = 0;
+
+static inline void snapshotEncoders(long &left, long &right)
+{
+    noInterrupts();
+    left = encLeftCount;
+    right = encRightCount;
+    interrupts();
+}
+
+static inline void encoderPollUpdate()
+{
+    // NeoSWSerial uses pin-change ISRs internally; to avoid ISR vector conflicts,
+    // we do fast polling here (direct port read) and count rising edges.
+    const uint8_t nowPortD = PIND;
+    const uint8_t changed = nowPortD ^ encLastPortD;
+    encLastPortD = nowPortD;
+
+    if (changed & _BV(4)) {
+        if (nowPortD & _BV(4)) {
+            encRightCount += (ENC_RIGHT_INVERT ? -1 : 1);
+        }
+    }
+    if (changed & _BV(5)) {
+        if (nowPortD & _BV(5)) {
+            encLeftCount += (ENC_LEFT_INVERT ? -1 : 1);
+        }
+    }
+}
+
 // Angle parameters
 float Angle;
 // Setpoint/trim angle used by the balance controller (calibrated at startup).
@@ -35,8 +79,16 @@ float Q_angle = 0.001;
 float Q_gyro = 0.003;
 float R_angle = 0.5;
 char C_0 = 1;
+// Control-loop timestep (seconds). Updated from micros() at runtime.
 float dt = 0.005;
 float K1 = 0.05;
+
+// Control-loop dt statistics (microseconds) for jitter validation.
+static uint32_t dtLastUs = 0;
+static uint32_t dtMinUs = 0xFFFFFFFFu;
+static uint32_t dtMaxUs = 0;
+static uint32_t dtSumUs = 0;
+static uint16_t dtCount = 0;
 
 float K_0, K_1, t_0, t_1;
 float angle_err;
@@ -63,6 +115,18 @@ unsigned long lastDebug = 0;     // USB Serial status interval
 unsigned long lastCSV = 0;       // 50 Hz extSerial
 unsigned long lastSettingsSent = 0;
 const unsigned long settingsIntervalMs = 20000;
+
+// NOTE: extSerial uses NeoSWSerial (bit-banged). At 9600 baud, each character costs ~1ms of CPU.
+// A long CSV line can easily consume tens of milliseconds and starve the 200 Hz control loop.
+// Keep telemetry low-rate unless you increase the baud rate.
+static const unsigned long telemetryIntervalMs = 500; // 2 Hz
+
+// Encoder reporting (keep separate so we don't break existing T: CSV parsing)
+unsigned long lastEncReport = 0;
+const unsigned long encReportIntervalMs = 200; // 5 Hz
+
+// Motor deadband compensation (0 disables). Tunable at runtime via ESP32 command.
+static uint8_t minPwm = 0;
 
 // EEPROM save debounce (write endurance + avoid blocking too often)
 const unsigned long settingsSaveDebounceMs = 1000;
@@ -160,10 +224,23 @@ void angle_calculate(int16_t ax, int16_t ay, int16_t az,
                      int16_t gx, int16_t gy, int16_t gz,
                      float dt, float Q_angle, float Q_gyro,
                      float R_angle, float C_0, float K1);
-void Kalman_Filter(double angle_m, double gyro_m);
-void Yiorderfilter(float angle_m, float gyro_m);
+void Kalman_Filter(double angle_m, double gyro_m, float dt);
+void Yiorderfilter(float angle_m, float gyro_m, float dt);
 void PD();
 void anglePWM();
+
+// Control loop scheduling (runs in loop() at ~200 Hz).
+static const uint32_t kControlPeriodUs = 5000;
+static uint32_t lastControlUs = 0;
+
+static inline float clampf(float v, float lo, float hi);
+
+static inline float clampDt(float dtSeconds)
+{
+    // Prevent huge dt (e.g., serial blocking) from destabilizing the filter/controller.
+    // Also avoid dt=0 which would freeze the integrator/estimator.
+    return clampf(dtSeconds, 0.001f, 0.020f);
+}
 
 static inline float clampf(float v, float lo, float hi)
 {
@@ -269,6 +346,11 @@ void setup()
     pinMode(PWM_R, OUTPUT);
     pinMode(PWM_L, OUTPUT);
 
+    // Encoders (Hall pulse inputs on D4/D5 via pin-change interrupt)
+    pinMode(ENC_RIGHT_PIN, INPUT_PULLUP);
+    pinMode(ENC_LEFT_PIN, INPUT_PULLUP);
+    encLastPortD = PIND;
+
     digitalWrite(right_R1, 1);
     digitalWrite(right_R2, 0);
     digitalWrite(left_L1, 0);
@@ -314,19 +396,51 @@ void setup()
     calibratedZeroDeg = sum / 400.0;
     setpointDeg = calibratedZeroDeg + trimDeg;
 
+    // Start the control scheduler now that calibration is complete.
+    lastControlUs = micros();
+
+    // Initialize encoder reporting baselines after calibration.
+    lastEncReport = millis();
+
     // Send settings record once at startup (after calibration)
     sendSettingsRecord();
     lastSettingsSent = millis();
 
-    // Timer2 ISR every 5ms
-    MsTimer2::set(5, DSzhongduan);
-    MsTimer2::start();
+    // NOTE: Control loop runs in loop() (micros-scheduled). We avoid doing I2C in an ISR.
 }
 
 // ---------------- MAIN LOOP ----------------
 void loop()
 {
+    // Sample encoders as frequently as possible (polling edge detector).
+    encoderPollUpdate();
+
     unsigned long now = millis();
+    static long lastEncLeft = 0;
+    static long lastEncRight = 0;
+
+    // ---------------- 200 Hz CONTROL LOOP ----------------
+    // Run the controller as close to 200 Hz as possible, using measured dt.
+    // This avoids timing jitter from software serial / I2C inside ISRs.
+    const uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - lastControlUs) >= kControlPeriodUs) {
+        const uint32_t elapsedUs = (uint32_t)(nowUs - lastControlUs);
+        lastControlUs = nowUs;
+
+        // Track real dt to validate timing stability.
+        dtLastUs = elapsedUs;
+        if (elapsedUs < dtMinUs) dtMinUs = elapsedUs;
+        if (elapsedUs > dtMaxUs) dtMaxUs = elapsedUs;
+        dtSumUs += elapsedUs;
+        if (dtCount != 0xFFFFu) dtCount++;
+
+        dt = clampDt(elapsedUs * 1e-6f);
+
+        mpu6050.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        angle_calculate(ax, ay, az, gx, gy, gz, dt, Q_angle, Q_gyro, R_angle, C_0, K1);
+        PD();
+        anglePWM();
+    }
 
     // Flush any pending EEPROM save (debounced)
     flushSettingsSaveIfDue(now);
@@ -366,45 +480,102 @@ void loop()
     if (now - lastDebug >= 10000) {
         lastDebug = now;
 
+        long l, r;
+        snapshotEncoders(l, r);
+
         Serial.print("angle=");
         Serial.print(angle);
         Serial.print(" speed=");
         Serial.print(angle_speed);
         Serial.print(" pwm=");
         Serial.print(PD_pwm);
+        Serial.print(" dt_us=");
+        Serial.print(dtLastUs);
+        Serial.print(" minPWM=");
+        Serial.print(minPwm);
+        Serial.print(" encL=");
+        Serial.print(l);
+        Serial.print(" encR=");
+        Serial.print(r);
         Serial.println();
     }
 
-    // ----------- 50 Hz CSV Telemetry on extSerial -----------
-    if (now - lastCSV >= 20) {
+    // ----------- Encoder CSV Telemetry (low-rate) -----------
+    // Separate frame type so existing ESP32 parsing of T: does not break.
+    // E: <encLeft>,<encRight>,<dEncLeft>,<dEncRight>
+    if (now - lastEncReport >= encReportIntervalMs) {
+        lastEncReport = now;
+
+        long l, r;
+        snapshotEncoders(l, r);
+        const long dL = l - lastEncLeft;
+        const long dR = r - lastEncRight;
+        lastEncLeft = l;
+        lastEncRight = r;
+
+        // Only extSerial gets the structured frame; USB Serial stays human-readable.
+        extSerial.print("E:");
+        extSerial.print(l);
+        extSerial.print(",");
+        extSerial.print(r);
+        extSerial.print(",");
+        extSerial.print(dL);
+        extSerial.print(",");
+        extSerial.print(dR);
+        extSerial.println();
+    }
+
+    // ----------- CSV Telemetry on extSerial -----------
+    // NOTE: Keep this rate modest: NeoSWSerial @ 9600 can block and wreck control-loop timing.
+    // If you need higher-rate telemetry, increase extSerial baud (and receiver baud) first.
+    if (now - lastCSV >= telemetryIntervalMs) {
         lastCSV = now;
 
-        // CSV: angle,angle_speed,gyro_x,pd_pwm,pwm1,pwm2
+        // Optional lightweight heartbeat (printing every 20ms can add serial blocking/jitter).
+        static unsigned long lastDot = 0;
+        if (now - lastDot >= 1000) {
+            lastDot = now;
+            Serial.print(".");
+        }
+        
+        // CSV: angle,angle_speed,gyro_x,pd_pwm,pwm1,pwm2,dt_last_us,dt_min_us,dt_max_us,dt_avg_us,dt_n
+        const uint32_t dtAvgUs = (dtCount > 0) ? (dtSumUs / dtCount) : 0;
+        const uint32_t dtMinOutUs = (dtMinUs == 0xFFFFFFFFu) ? 0 : dtMinUs;
         extSerial.print("T:");
-        extSerial.print(angle);
+        extSerial.print(angle, 2);
         extSerial.print(",");
-        extSerial.print(angle_speed);
+        extSerial.print(angle_speed, 2);
         extSerial.print(",");
-        extSerial.print(Gyro_x);
+        extSerial.print(Gyro_x, 2);
         extSerial.print(",");
         extSerial.print(PD_pwm);
         extSerial.print(",");
-        extSerial.print(pwm1);
+        extSerial.print((int)pwm1);
         extSerial.print(",");
-        extSerial.print(pwm2);
+        extSerial.print((int)pwm2);
+        extSerial.print(",");
+        extSerial.print(dtLastUs);
+        extSerial.print(",");
+        extSerial.print(dtMinOutUs);
+        extSerial.print(",");
+        extSerial.print(dtMaxUs);
+        extSerial.print(",");
+        extSerial.print(dtAvgUs);
+        extSerial.print(",");
+        extSerial.print(dtCount);
         extSerial.println();
+
+        // Reset dt window each time we emit a T: line.
+        dtMinUs = 0xFFFFFFFFu;
+        dtMaxUs = 0;
+        dtSumUs = 0;
+        dtCount = 0;
     }
 }
 
-// ---------------- ISR ----------------
-void DSzhongduan()
-{
-    sei();
-    mpu6050.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    angle_calculate(ax, ay, az, gx, gy, gz, dt, Q_angle, Q_gyro, R_angle, C_0, K1);
-    PD();
-    anglePWM();
-}
+    // ---------------- ISR ----------------
+    // Legacy hook retained for compatibility, but intentionally unused.
+    void DSzhongduan() {}
 
 // ---------------- ESP32 COMMAND HANDLING ----------------
 // Supported payload formats (all lines must start with "C:"):
@@ -412,6 +583,7 @@ void DSzhongduan()
 //     C:SP,<setpoint>
 //     C:PID,<kp>,<ki>,<kd>
 //     C:KF,<Q_angle>,<Q_gyro>,<R_angle>
+//     C:MINPWM,<0-255>  (motor deadband compensation; 0 disables)
 //     C:SET,<setpoint>,<kp>,<ki>,<kd>,<Q_angle>,<Q_gyro>,<R_angle>,<K1>
 //     C:RESET       (clears PID integral)
 //     C:KFRESET     (resets Kalman internal state P/q_bias)
@@ -516,6 +688,17 @@ bool handleEsp32CommandLine(const String &line)
     }
 
     int pos = (firstComma >= 0) ? (firstComma + 1) : payloadLen;
+
+    if (cmd == "MINPWM") {
+        String t0 = tokenAfter(pos);
+        if (t0.length() == 0) return false;
+        long v = t0.toInt();
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        minPwm = (uint8_t)v;
+        extSerial.println("A:OK");
+        return true;
+    }
 
     if (cmd == "SP") {
         String t0 = tokenAfter(pos);
@@ -647,17 +830,17 @@ void angle_calculate(int16_t ax, int16_t ay, int16_t az,
 {
     Angle = -atan2(ay, az) * (180 / PI);
     Gyro_x = -gx / 131.0;
-    Kalman_Filter(Angle, Gyro_x);
+    Kalman_Filter(Angle, Gyro_x, dt);
 
     Gyro_z = -gz / 131.0;
 
     float angleAx = -atan2(ax, az) * (180 / PI);
     Gyro_y = -gy / 131.0;
-    Yiorderfilter(angleAx, Gyro_y);
+    Yiorderfilter(angleAx, Gyro_y, dt);
 }
 
 // ---------------- KALMAN FILTER ----------------
-void Kalman_Filter(double angle_m, double gyro_m)
+void Kalman_Filter(double angle_m, double gyro_m, float dt)
 {
     angle += (gyro_m - q_bias) * dt;
     angle_err = angle_m - angle;
@@ -693,7 +876,7 @@ void Kalman_Filter(double angle_m, double gyro_m)
 }
 
 // ---------------- FIRST ORDER FILTER ----------------
-void Yiorderfilter(float angle_m, float gyro_m)
+void Yiorderfilter(float angle_m, float gyro_m, float dt)
 {
     angleY_one = K1 * angle_m + (1 - K1) * (angleY_one + gyro_m * dt);
 }
@@ -727,6 +910,14 @@ void anglePWM()
     if (pwm1 < -255) pwm1 = -255;
     if (pwm2 > 255) pwm2 = 255;
     if (pwm2 < -255) pwm2 = -255;
+
+    // Optional deadband compensation: ensure a minimum duty when commanding non-zero.
+    if (minPwm != 0) {
+        if (pwm1 > 0 && pwm1 < minPwm) pwm1 = minPwm;
+        if (pwm1 < 0 && -pwm1 < minPwm) pwm1 = -minPwm;
+        if (pwm2 > 0 && pwm2 < minPwm) pwm2 = minPwm;
+        if (pwm2 < 0 && -pwm2 < minPwm) pwm2 = -minPwm;
+    }
 
     if (angle > 80 || angle < -80) {
         pwm1 = pwm2 = 0;

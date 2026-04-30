@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Kill Serial Monitor",
+      "type": "shell",
+      "command": "pio device monitor --exit",
+      "problemMatcher": [],
+      "group": "none"
+    },
+    {
+      "label": "Upload Firmware",
+      "type": "shell",
+      "command": "pio run -t upload",
+      "problemMatcher": [],
+      "group": "none"
+    },
+    {
+      "label": "Reopen Serial Monitor",
+      "type": "shell",
+      "command": "pio device monitor",
+      "problemMatcher": [],
+      "isBackground": true,
+      "group": "none"
+    },
+    {
+      "label": "Upload (Auto‑Close Monitor)",
+      "dependsOn": [
+        "Kill Serial Monitor",
+        "Upload Firmware",
+        "Reopen Serial Monitor"
+      ],
+      "problemMatcher": [],
+      "group": "build"
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Threading.Tasks;
+using dashboard.Services;
 using Terminal.Gui.ViewBase;
 
 namespace dashboard.Views;
@@ -9,6 +11,7 @@ public class LogView : View
 {
     private readonly object _lock = new();
     private readonly List<string> _logMessages = new();
+    private readonly BufferedSessionLogWriter _sessionLogWriter = new();
     private int _messageCountAtLastDraw;
 
     /// <summary>When false, messages are buffered but no redraw is requested.</summary>
@@ -24,9 +27,11 @@ public class LogView : View
 
     public void AddMessage(string message)
     {
+        _sessionLogWriter.Enqueue(message);
+
         lock (_lock)
         {
-            _logMessages.Add($"{DateTime.Now:HH:mm:ss}: {message}");
+            _logMessages.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}: {message}");
         }
 
         if (LogVisible)
@@ -58,6 +63,11 @@ public class LogView : View
     {
         if (LogVisible)
             ToggleVisibility();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        return _sessionLogWriter.DisposeAsync();
     }
 
     protected override bool OnDrawingSubViews()
