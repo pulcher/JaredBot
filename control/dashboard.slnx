@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/research/">
+    <Project Path="research/signalR-sender/signalR-sender.csproj" />
+  </Folder>
   <Project Path="../research/signalR-playground/signalR-playground.csproj" Id="e7a767a0-22e9-4c01-8cce-54b902ff31f2" />
   <Project Path="dashboard/dashboard.csproj" />
 </Solution>

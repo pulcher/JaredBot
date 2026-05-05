@@ -13,20 +13,25 @@ public sealed class SignalRListenerService : IAsyncDisposable
 {
     private readonly Uri _uri;
     private readonly Action<string> _onMessage;
-    private readonly Action<TelemetrySnapshot>? _onTelemetry;
     private readonly TelemetryState? _telemetry;
+    private readonly Action<TelemetrySnapshot>? _onTelemetry;
+    private readonly Action<ControlConfigSnapshot>? _onConfig;
     private readonly CancellationTokenSource _cts = new();
 
-    // Backoff settings (same as playground)
-    private const int MinBackoffMs = 500;
-    private const int MaxBackoffMs = 30_000;
-    private const double BackoffFactor = 2.0;
+    private readonly object _wsLock = new();
+    private ClientWebSocket? _ws;
+
+    private readonly object _reconnectLock = new();
+    private CancellationTokenSource _reconnectCts = new();
+
+    private const int ReconnectDelayMs = 500;
 
     public SignalRListenerService(
         string hubUrl,
         Action<string> onMessage,
         TelemetryState? telemetry = null,
-        Action<TelemetrySnapshot>? onTelemetry = null)
+        Action<TelemetrySnapshot>? onTelemetry = null,
+        Action<ControlConfigSnapshot>? onConfig = null)
     {
         if (!Uri.TryCreate(hubUrl, UriKind.Absolute, out var uri) ||
             (uri.Scheme != "ws" && uri.Scheme != "wss"))
@@ -38,36 +43,48 @@ public sealed class SignalRListenerService : IAsyncDisposable
         _onMessage = onMessage ?? throw new ArgumentNullException(nameof(onMessage));
         _telemetry = telemetry;
         _onTelemetry = onTelemetry;
+        _onConfig = onConfig;
     }
 
     public async Task StartAsync()
     {
         _onMessage($"[WS] Connecting to {_uri} (press 'Q' in dashboard to quit).");
 
-        var backoffMs = MinBackoffMs;
-
         while (!_cts.IsCancellationRequested)
         {
+            CancellationTokenSource iterationCts;
+            lock (_reconnectLock)
+            {
+                iterationCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, _reconnectCts.Token);
+            }
+
             var connected = false;
 
             try
             {
-                connected = await ConnectAndReceiveLoopAsync(_uri, _cts.Token);
+                connected = await ConnectAndReceiveLoopAsync(_uri, iterationCts.Token).ConfigureAwait(false);
                 if (connected)
                 {
                     // We had a successful session (connect + at least one receive or clean close)
-                    backoffMs = MinBackoffMs;
                 }
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
+                iterationCts.Dispose();
                 break;
+            }
+            catch (OperationCanceledException)
+            {
+                // Reconnect was requested — skip the delay and retry immediately.
+                _onMessage("[WS] Reconnect signal received, retrying now...");
+                iterationCts.Dispose();
+                continue;
             }
             catch (WebSocketException wex) when (wex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
             {
                 _onMessage("[WS] Connection closed prematurely by remote. Will retry.");
                 _onMessage($"[WS] WebSocketException: ErrorCode={wex.ErrorCode}, WebSocketErrorCode={wex.WebSocketErrorCode}");
-                backoffMs = await WaitWithBackoffAsync(backoffMs);
+                await WaitBeforeReconnectAsync(iterationCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -79,41 +96,45 @@ public sealed class SignalRListenerService : IAsyncDisposable
                 if (ex.InnerException is SocketException sex)
                     _onMessage($"[WS] SocketException: Code={sex.SocketErrorCode}, Message={sex.Message}");
 
-                backoffMs = await WaitWithBackoffAsync(backoffMs);
+                await WaitBeforeReconnectAsync(iterationCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                iterationCts.Dispose();
             }
         }
 
         _onMessage("[WS] Listener stopped.");
     }
 
-    private async Task<int> WaitWithBackoffAsync(int backoffMs)
+    private async Task WaitBeforeReconnectAsync(CancellationToken cancellation)
     {
-        const int ConstantBackoffMs = 750;
-
-        _onMessage($"[WS] Reconnecting in {ConstantBackoffMs}ms...");
+        _onMessage($"[WS] Reconnecting in {ReconnectDelayMs}ms...");
 
         try
         {
-            await Task.Delay(ConstantBackoffMs, _cts.Token);
+            await Task.Delay(ReconnectDelayMs, cancellation).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            return ConstantBackoffMs;
+            return;
         }
-
-        // Always return the same backoff
-        return ConstantBackoffMs;
     }
 
     private async Task<bool> ConnectAndReceiveLoopAsync(Uri uri, CancellationToken cancellation)
     {
         using var ws = new ClientWebSocket();
-        ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(0); // disable built-in pings
+        ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(0);
+
+        lock (_wsLock)
+        {
+            _ws = ws;
+        }
 
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        connectTimeout.CancelAfter(TimeSpan.FromSeconds(30)); // give ESP32 more time
+        connectTimeout.CancelAfter(TimeSpan.FromSeconds(30));
 
-        await ws.ConnectAsync(uri, connectTimeout.Token);
+        await ws.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
         _onMessage("[WS] Connected. Receiving frames until shutdown or remote close...");
 
         var buffer = new byte[16 * 1024];
@@ -130,47 +151,119 @@ public sealed class SignalRListenerService : IAsyncDisposable
                 {
                     do
                     {
-                        result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellation);
+                        result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellation).ConfigureAwait(false);
 
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
                             _onMessage($"[WS] Server sent close: {result.CloseStatus} - {result.CloseStatusDescription}");
-                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client ack", CancellationToken.None);
-                            return false;
+                            using var closeAckTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client ack", closeAckTimeout.Token).ConfigureAwait(false);
+                            return gotAnyData;
                         }
 
                         if (result.Count > 0)
                             gotAnyData = true;
 
                         ms.Write(buffer, 0, result.Count);
-                    } 
+                    }
                     while (!result.EndOfMessage);
                 }
                 catch (WebSocketException wsex)
                 {
                     _onMessage($"[WS] Receive failed: {wsex.Message}");
                     _onMessage($"[WS] WebSocketState={ws.State}, ErrorCode={wsex.ErrorCode}, WebSocketErrorCode={wsex.WebSocketErrorCode}");
-                    throw;
+                    break;
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
                 {
                     break;
                 }
 
-                var messageBytes = ms.ToArray();
-                await ProcessFrameAsync(result.MessageType, messageBytes);
+                await ProcessFrameAsync(result.MessageType, ms.ToArray()).ConfigureAwait(false);
             }
         }
         finally
         {
+            lock (_wsLock)
+            {
+                if (ReferenceEquals(_ws, ws))
+                    _ws = null;
+            }
+
             if (ws.State == WebSocketState.Open)
             {
-                try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Client done", CancellationToken.None); }
+                try
+                {
+                    using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Client done", closeTimeout.Token).ConfigureAwait(false);
+                }
                 catch { }
             }
         }
 
-        return gotAnyData || true; // we had a clean session
+        return gotAnyData;
+    }
+
+    public Task SendCommandAsync(string commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine))
+            return Task.CompletedTask;
+
+        ClientWebSocket? ws;
+        lock (_wsLock)
+        {
+            ws = _ws;
+        }
+
+        if (ws is null || ws.State != WebSocketState.Open)
+        {
+            _onMessage("[WS] Cannot send command: not connected.");
+            return Task.CompletedTask;
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(commandLine);
+        return ws.SendAsync(bytes, WebSocketMessageType.Text, true, _cts.Token);
+    }
+
+    public void SendCommand(string commandLine)
+    {
+        _ = SendCommandAsync(commandLine);
+    }
+
+    public async Task ReconnectAsync()
+    {
+     _onMessage("[WS] Reconnect requested.");
+
+        // Signal the current iteration to cancel (interrupts delay or ConnectAsync).
+        lock (_reconnectLock)
+        {
+            _reconnectCts.Cancel();
+            _reconnectCts.Dispose();
+            _reconnectCts = new CancellationTokenSource();
+        }
+
+        // Also abort the current websocket if one exists.
+        ClientWebSocket? ws;
+        lock (_wsLock)
+        {
+            ws = _ws;
+        }
+
+        if (ws is null)
+            return;
+
+        try
+        {
+            ws.Abort();
+        }
+        catch
+        {
+        }
+    }
+
+    public void Reconnect()
+    {
+        _ = ReconnectAsync();
     }
 
     private Task ProcessFrameAsync(WebSocketMessageType type, byte[] payload)
@@ -178,71 +271,71 @@ public sealed class SignalRListenerService : IAsyncDisposable
         if (type == WebSocketMessageType.Text)
         {
             var text = SafeUtf8(payload);
-            _onMessage(text); // raw line to log
+            _onMessage(text);
+
+            if (text.Equals("A:OK", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("A:ERR", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.CompletedTask;
+            }
 
             if (text.StartsWith("T:", StringComparison.OrdinalIgnoreCase))
             {
                 var snapshot = ParseTelemetryCsv(text);
-                if ( snapshot is not null)
+                if (snapshot is not null)
                 {
-                    // Update shared state if used
                     _telemetry?.Update(snapshot);
-                    // Immediate UI update callback
                     _onTelemetry?.Invoke(snapshot);
                 }
+
+                return Task.CompletedTask;
             }
-            else
+
+            if (text.StartsWith("S:", StringComparison.OrdinalIgnoreCase))
             {
-                // optional: keep key=value parsing for non-telemetry messages
-                var pairs = ParseKeyValuePairs(text);
-                if (pairs.Count > 0)
-                {
-                    foreach (var kv in pairs)
-                        _onMessage($"{kv.Key} = {kv.Value}");
-                }
+                var cfg = ParseConfigCsv(text);
+                if (cfg is not null)
+                    _onConfig?.Invoke(cfg);
+
+                return Task.CompletedTask;
             }
+
+            var pairs = ParseKeyValuePairs(text);
+            if (pairs.Count > 0)
+            {
+                foreach (var kv in pairs)
+                    _onMessage($"{kv.Key} = {kv.Value}");
+            }
+
+            return Task.CompletedTask;
         }
-        else
-        {
-            var previewLen = Math.Min(payload.Length, 128);
-            var hex = Convert.ToHexString(payload, 0, previewLen);
-            var preview = payload.Length <= previewLen ? hex : hex + "...";
-            _onMessage($"Binary preview (hex): {preview}");
-        }
+
+        var previewLen = Math.Min(payload.Length, 128);
+        var hex = Convert.ToHexString(payload, 0, previewLen);
+        var preview = payload.Length <= previewLen ? hex : hex + "...";
+        _onMessage($"Binary preview (hex): {preview}");
 
         return Task.CompletedTask;
     }
 
-    private TelemetrySnapshot? ParseTelemetryCsv(string line)
+    private static TelemetrySnapshot? ParseTelemetryCsv(string line)
     {
-        // Example: T:-0.01,0.36,6.02,2.00,2.00
         var span = line.AsSpan().Trim();
+        if (!span.StartsWith("T:", StringComparison.OrdinalIgnoreCase))
+            return null;
 
-        if (span.StartsWith("T:", StringComparison.OrdinalIgnoreCase))
-        {
-            span = span[2..].TrimStart();
-        }
-
-        var csv = span.ToString();
-        var parts = csv.Split(',', StringSplitOptions.TrimEntries);
-
+        span = span[2..].TrimStart();
+        var parts = span.ToString().Split(',', StringSplitOptions.TrimEntries);
         if (parts.Length < 3)
-            return null; // not enough data
+            return null;
 
-        double? TryDoubleAt(int index)
+        static double? TryParseAt(string[] p, int index)
         {
-            if (index < 0 || index >= parts.Length)
+            if (index < 0 || index >= p.Length)
                 return null;
 
-            var s = parts[index];
-            if (double.TryParse(
-                    s,
-                    System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture,
-                    out var v))
-            {
+            if (double.TryParse(p[index], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var v))
                 return v;
-            }
 
             return null;
         }
@@ -251,26 +344,52 @@ public sealed class SignalRListenerService : IAsyncDisposable
         {
             UtcTimestamp = DateTime.UtcNow,
             RawLine = line,
+            Roll = TryParseAt(parts, 0),
+            Pitch = TryParseAt(parts, 1),
+            Yaw = TryParseAt(parts, 2),
+            Custom1 = TryParseAt(parts, 3),
+            Custom2 = TryParseAt(parts, 4)
+        };
+    }
 
-            Roll = TryDoubleAt(0),
-            Pitch = TryDoubleAt(1),
-            Yaw = TryDoubleAt(2),
+    private static ControlConfigSnapshot? ParseConfigCsv(string line)
+    {
+        var span = line.AsSpan().Trim();
+        if (!span.StartsWith("S:", StringComparison.OrdinalIgnoreCase))
+            return null;
 
-            Custom1 = TryDoubleAt(3),
-            Custom2 = TryDoubleAt(4)
+        span = span[2..].TrimStart();
+        var parts = span.ToString().Split(',', StringSplitOptions.TrimEntries);
+        if (parts.Length < 4)
+            return null;
+
+        static double? TryParse(string s)
+        {
+            if (double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var v))
+                return v;
+
+            return null;
+        }
+
+        return new ControlConfigSnapshot
+        {
+            UtcTimestamp = DateTime.UtcNow,
+            RawLine = line,
+            Setpoint = TryParse(parts[0]),
+            Kp = TryParse(parts[1]),
+            Ki = TryParse(parts[2]),
+            Kd = TryParse(parts[3]),
+            QAngle = parts.Length > 4 ? TryParse(parts[4]) : null,
+            QGyro = parts.Length > 5 ? TryParse(parts[5]) : null,
+            RAngle = parts.Length > 6 ? TryParse(parts[6]) : null,
+            K1 = parts.Length > 7 ? TryParse(parts[7]) : null
         };
     }
 
     private static string SafeUtf8(byte[] bytes)
     {
-        try
-        {
-            return Encoding.UTF8.GetString(bytes);
-        }
-        catch
-        {
-            return "<invalid-utf8>";
-        }
+        try { return Encoding.UTF8.GetString(bytes); }
+        catch { return "<invalid-utf8>"; }
     }
 
     private static System.Collections.Generic.Dictionary<string, string> ParseKeyValuePairs(string input)
@@ -284,13 +403,9 @@ public sealed class SignalRListenerService : IAsyncDisposable
             var v = m.Groups["v"].Value;
 
             if (!dict.ContainsKey(k))
-            {
                 dict[k] = v;
-            }
             else
-            {
                 dict[k] = dict[k] + "," + v;
-            }
         }
 
         return dict;
@@ -298,14 +413,12 @@ public sealed class SignalRListenerService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        try
+        try { _cts.Cancel(); } catch { }
+        lock (_reconnectLock)
         {
-            _cts.Cancel();
+            try { _reconnectCts.Cancel(); } catch { }
+            _reconnectCts.Dispose();
         }
-        catch
-        {
-        }
-
         _cts.Dispose();
         await Task.CompletedTask;
     }

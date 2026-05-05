@@ -1,4 +1,4 @@
-# Workspace Instructions (serial_relay)
+ # Workspace Instructions (serial_relay)
 
 ## Project Rule: Keep PCB Notes Current
 
