@@ -25,7 +25,7 @@ enum class SystemMode : uint8_t {
 };
 
 static constexpr BringupMode kBringupMode = BringupMode::Normal;
-static constexpr bool kAutoArmAfterCalibration = false;
+static constexpr bool kAutoArmAfterCalibration = true;
 
 static constexpr uint8_t kRightMotorIn1 = 8;
 static constexpr uint8_t kRightMotorIn2 = 12;
@@ -56,10 +56,10 @@ static constexpr uint32_t kControlPeriodUs = 5000;
 static constexpr uint16_t kCalibrationSamples = 400;
 static constexpr uint16_t kCalibrationDelayMs = 5;
 
-static constexpr unsigned long kUsbRuntimeTelemetryMs = 100;
-static constexpr unsigned long kUsbEncoderTelemetryMs = 250;
-static constexpr unsigned long kRelayRuntimeTelemetryMs = 500;
-static constexpr unsigned long kRelayEncoderTelemetryMs = 500;
+static constexpr unsigned long kUsbRuntimeTelemetryMs = 1000;
+static constexpr unsigned long kUsbEncoderTelemetryMs = 1000;
+static constexpr unsigned long kRelayRuntimeTelemetryMs = 1000;
+static constexpr unsigned long kRelayEncoderTelemetryMs = 0;
 static constexpr unsigned long kSettingsTelemetryMs = 15000;
 static constexpr unsigned long kStateTelemetryMs = 1000;
 

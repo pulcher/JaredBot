@@ -7,12 +7,12 @@ struct ControlSettings
     float trimDeg = 0.0f;
 
     float kp = 34.0f;
-    float ki = 0.0f;
-    float kd = 0.62f;
+    float ki = 0.02f;
+    float kd = 0.90f;
 
-    float holdKp = 0.015f;
-    float holdKi = 0.0015f;
-    float velocityKp = 0.020f;
+    float holdKp = 0.0f;
+    float holdKi = 0.0f;
+    float velocityKp = 0.0f;
 
     float qAngle = 0.001f;
     float qGyro = 0.003f;

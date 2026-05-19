@@ -12,8 +12,11 @@ public:
     Telemetry(Print &usb, Print &relay);
 
     void sendBoot(const __FlashStringHelper *message);
-    void sendEvent(const __FlashStringHelper *eventName, const String &detail);
-    void sendState(hw::SystemMode mode, bool armed, const String &faultName);
+    void sendEvent(const __FlashStringHelper *eventName, const char *detail);
+    void sendEvent(const __FlashStringHelper *eventName, const __FlashStringHelper *detail);
+    void sendFault(const __FlashStringHelper *faultCode, const char *detail);
+    void sendFault(const __FlashStringHelper *faultCode, const __FlashStringHelper *detail);
+    void sendState(hw::SystemMode mode, bool armed, const __FlashStringHelper *faultName);
     void sendSettings(const ControlSettings &settings, float calibratedZeroDeg);
     void sendRuntime(float angleDeg, float angleRateDegPerSec, float yawRateDegPerSec,
                      const ControlOutput &output, uint32_t dtLastUs, uint32_t dtMinUs,
@@ -26,7 +29,7 @@ private:
     Print &usb_;
     Print &relay_;
     const __FlashStringHelper *modeName(hw::SystemMode mode) const;
-    void printStateFrame(Print &out, hw::SystemMode mode, bool armed, const String &faultName);
+    void printStateFrame(Print &out, hw::SystemMode mode, bool armed, const __FlashStringHelper *faultName);
     void printSettingsFrame(Print &out, const ControlSettings &settings, float calibratedZeroDeg);
     void printRuntimeFrame(Print &out, float angleDeg, float angleRateDegPerSec, float yawRateDegPerSec,
                            const ControlOutput &output, uint32_t dtLastUs, uint32_t dtMinUs,

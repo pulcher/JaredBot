@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <NeoSWSerial.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "balance_controller.h"
 #include "encoder_service.h"
@@ -11,6 +14,8 @@
 #include "telemetry.h"
 
 namespace {
+
+constexpr uint8_t kCommandBufferCapacity = 160;
 
 enum class FaultCode : uint8_t {
     None = 0,
@@ -58,8 +63,10 @@ struct RuntimeContext
     int16_t rawLeftPwm = 0;
     int16_t rawRightPwm = 0;
     bool rawMotorOverride = false;
-    String relayCommandBuffer;
-    String usbCommandBuffer;
+    char relayCommandBuffer[kCommandBufferCapacity + 1] = {};
+    char usbCommandBuffer[kCommandBufferCapacity + 1] = {};
+    uint8_t relayCommandLength = 0;
+    uint8_t usbCommandLength = 0;
 };
 
 NeoSWSerial relaySerial(hw::kRelayRxPin, hw::kRelayTxPin);
@@ -103,13 +110,22 @@ hw::SystemMode defaultMode()
     return hw::SystemMode::Idle;
 }
 
-void setFault(FaultCode code, const String &detail)
+void setFault(FaultCode code, const char *detail)
 {
     runtime.fault = code;
     runtime.mode = hw::SystemMode::Fault;
     controller.disarm();
     motors.stop();
-    telemetry.sendEvent(F("FAULT"), String((const __FlashStringHelper *)faultName(code)) + "," + detail);
+    telemetry.sendFault(faultName(code), detail);
+}
+
+void setFault(FaultCode code, const __FlashStringHelper *detail)
+{
+    runtime.fault = code;
+    runtime.mode = hw::SystemMode::Fault;
+    controller.disarm();
+    motors.stop();
+    telemetry.sendFault(faultName(code), detail);
 }
 
 void clearFault()
@@ -153,7 +169,7 @@ void saveSettingsIfDue(unsigned long nowMs)
 
 void sendStateTelemetry()
 {
-    telemetry.sendState(runtime.mode, controller.armed(), String((const __FlashStringHelper *)faultName(runtime.fault)));
+    telemetry.sendState(runtime.mode, controller.armed(), faultName(runtime.fault));
 }
 
 void sendSettingsTelemetry()
@@ -259,39 +275,104 @@ void runBringupMode(unsigned long nowMs)
     }
 }
 
-String nextToken(String &payload)
+void trimWhitespace(char *text)
 {
-    const int comma = payload.indexOf(',');
-    String token;
-    if (comma < 0) {
-        token = payload;
-        payload = "";
-    } else {
-        token = payload.substring(0, comma);
-        payload = payload.substring(comma + 1);
+    char *start = text;
+    while (*start && isspace((unsigned char)*start)) {
+        ++start;
     }
-    token.trim();
+    if (start != text) {
+        memmove(text, start, strlen(start) + 1);
+    }
+
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) {
+        text[--len] = '\0';
+    }
+}
+
+char *nextToken(char *&payload)
+{
+    if (*payload == '\0') {
+        return payload;
+    }
+
+    char *token = payload;
+    char *comma = strchr(payload, ',');
+    if (comma == nullptr) {
+        payload += strlen(payload);
+    } else {
+        *comma = '\0';
+        payload = comma + 1;
+    }
+
+    trimWhitespace(token);
     return token;
 }
 
-bool parseFloatToken(String &payload, float &out)
+bool parseFloatToken(char *&payload, float &out)
 {
-    const String token = nextToken(payload);
-    if (token.length() == 0) {
+    char *token = nextToken(payload);
+    if (*token == '\0') {
         return false;
     }
-    out = token.toFloat();
+
+    char *end = nullptr;
+    out = (float)strtod(token, &end);
+    while (end != nullptr && *end && isspace((unsigned char)*end)) {
+        ++end;
+    }
+    if (end == token || (end != nullptr && *end != '\0')) {
+        return false;
+    }
     return true;
 }
 
-bool parseIntToken(String &payload, long &out)
+bool parseIntToken(char *&payload, long &out)
 {
-    const String token = nextToken(payload);
-    if (token.length() == 0) {
+    char *token = nextToken(payload);
+    if (*token == '\0') {
         return false;
     }
-    out = token.toInt();
+
+    char *end = nullptr;
+    out = strtol(token, &end, 10);
+    while (end != nullptr && *end && isspace((unsigned char)*end)) {
+        ++end;
+    }
+    if (end == token || (end != nullptr && *end != '\0')) {
+        return false;
+    }
     return true;
+}
+
+bool tokenEquals(const char *token, const char *value)
+{
+    while (*token && *value) {
+        if (toupper((unsigned char)*token) != toupper((unsigned char)*value)) {
+            return false;
+        }
+        ++token;
+        ++value;
+    }
+    return *token == '\0' && *value == '\0';
+}
+
+void formatSignedPair(char *buffer, size_t bufferSize, long left, long right)
+{
+    if (bufferSize == 0) {
+        return;
+    }
+
+    ltoa(left, buffer, 10);
+    size_t len = strlen(buffer);
+    if (len + 1 >= bufferSize) {
+        buffer[bufferSize - 1] = '\0';
+        return;
+    }
+
+    buffer[len++] = ',';
+    ltoa(right, buffer + len, 10);
 }
 
 int16_t clampPwmCommand(long value)
@@ -312,33 +393,33 @@ void sendFullStatus()
     sendSettingsTelemetry();
 }
 
-bool setModeFromString(const String &mode)
+bool setModeFromString(const char *mode)
 {
-    if (mode == F("IDLE")) {
+    if (tokenEquals(mode, "IDLE")) {
         disarmController();
         runtime.mode = hw::SystemMode::Idle;
         return true;
     }
-    if (mode == F("BALANCE")) {
+    if (tokenEquals(mode, "BALANCE")) {
         armControllerAtCurrentPosition();
         return true;
     }
-    if (mode == F("TEST_IMU")) {
+    if (tokenEquals(mode, "TEST_IMU")) {
         disarmController();
         runtime.mode = hw::SystemMode::TestImu;
         return true;
     }
-    if (mode == F("TEST_MOTORS")) {
+    if (tokenEquals(mode, "TEST_MOTORS")) {
         disarmController();
         runtime.mode = hw::SystemMode::TestMotors;
         return true;
     }
-    if (mode == F("TEST_ENCODERS")) {
+    if (tokenEquals(mode, "TEST_ENCODERS")) {
         disarmController();
         runtime.mode = hw::SystemMode::TestEncoders;
         return true;
     }
-    if (mode == F("TEST_SERIAL")) {
+    if (tokenEquals(mode, "TEST_SERIAL")) {
         disarmController();
         runtime.mode = hw::SystemMode::TestSerial;
         return true;
@@ -346,18 +427,18 @@ bool setModeFromString(const String &mode)
     return false;
 }
 
-bool handleCommandLine(const String &line)
+bool handleCommandLine(char *line)
 {
-    if (!line.startsWith("C:")) {
+    trimWhitespace(line);
+    if (line[0] != 'C' || line[1] != ':') {
         return false;
     }
 
-    String payload = line.substring(2);
-    payload.trim();
-    String command = nextToken(payload);
-    command.toUpperCase();
+    char *payload = line + 2;
+    trimWhitespace(payload);
+    char *command = nextToken(payload);
 
-    if (command == F("ARM")) {
+    if (tokenEquals(command, "ARM")) {
         long value = 0;
         if (!parseIntToken(payload, value)) return false;
         if (value != 0) {
@@ -368,39 +449,38 @@ bool handleCommandLine(const String &line)
         return true;
     }
 
-    if (command == F("MODE")) {
-        String mode = nextToken(payload);
-        mode.toUpperCase();
+    if (tokenEquals(command, "MODE")) {
+        char *mode = nextToken(payload);
         return setModeFromString(mode);
     }
 
-    if (command == F("STATUS")) {
+    if (tokenEquals(command, "STATUS")) {
         sendFullStatus();
         return true;
     }
 
-    if (command == F("SAVE")) {
+    if (tokenEquals(command, "SAVE")) {
         runtime.settingsDirty = true;
         runtime.settingsSaveDueAtMs = millis();
         return true;
     }
 
-    if (command == F("RESET")) {
+    if (tokenEquals(command, "RESET")) {
         controller.reset();
         return true;
     }
 
-    if (command == F("KFRESET")) {
+    if (tokenEquals(command, "KFRESET")) {
         imu.resetFilterState();
         return true;
     }
 
-    if (command == F("CLEARFAULT")) {
+    if (tokenEquals(command, "CLEARFAULT")) {
         clearFault();
         return true;
     }
 
-    if (command == F("STOP")) {
+    if (tokenEquals(command, "STOP")) {
         runtime.rawMotorOverride = false;
         runtime.rawLeftPwm = 0;
         runtime.rawRightPwm = 0;
@@ -411,7 +491,7 @@ bool handleCommandLine(const String &line)
         return true;
     }
 
-    if (command == F("ENCRESET")) {
+    if (tokenEquals(command, "ENCRESET")) {
         encoders.reset();
         runtime.lastUsbLeftCount = 0;
         runtime.lastUsbRightCount = 0;
@@ -421,7 +501,7 @@ bool handleCommandLine(const String &line)
         return true;
     }
 
-    if (command == F("RAWPWM")) {
+    if (tokenEquals(command, "RAWPWM")) {
         long left = 0;
         long right = 0;
         if (!parseIntToken(payload, left) || !parseIntToken(payload, right)) return false;
@@ -431,11 +511,13 @@ bool handleCommandLine(const String &line)
         runtime.rawMotorOverride = (runtime.rawLeftPwm != 0 || runtime.rawRightPwm != 0);
         runtime.mode = hw::SystemMode::TestMotors;
         applyRawMotorOverride();
-        telemetry.sendEvent(F("RAWPWM"), String(runtime.rawLeftPwm) + "," + String(runtime.rawRightPwm));
+        char detail[16];
+        formatSignedPair(detail, sizeof(detail), runtime.rawLeftPwm, runtime.rawRightPwm);
+        telemetry.sendEvent(F("RAWPWM"), detail);
         return true;
     }
 
-    if (command == F("TRIM")) {
+    if (tokenEquals(command, "TRIM")) {
         float value = 0.0f;
         if (!parseFloatToken(payload, value)) return false;
         settings.trimDeg = clampf(value, -12.0f, 12.0f);
@@ -444,29 +526,29 @@ bool handleCommandLine(const String &line)
         return true;
     }
 
-    if (command == F("KP") || command == F("KI") || command == F("KD") ||
-        command == F("HKP") || command == F("HKI") || command == F("VKP") ||
-        command == F("QA") || command == F("QG") || command == F("RA") ||
-        command == F("K1") || command == F("MINPWM")) {
+    if (tokenEquals(command, "KP") || tokenEquals(command, "KI") || tokenEquals(command, "KD") ||
+        tokenEquals(command, "HKP") || tokenEquals(command, "HKI") || tokenEquals(command, "VKP") ||
+        tokenEquals(command, "QA") || tokenEquals(command, "QG") || tokenEquals(command, "RA") ||
+        tokenEquals(command, "K1") || tokenEquals(command, "MINPWM")) {
         float value = 0.0f;
         if (!parseFloatToken(payload, value)) return false;
-        if (command == F("KP")) settings.kp = clampf(value, 0.0f, 200.0f);
-        else if (command == F("KI")) settings.ki = clampf(value, 0.0f, 50.0f);
-        else if (command == F("KD")) settings.kd = clampf(value, 0.0f, 20.0f);
-        else if (command == F("HKP")) settings.holdKp = clampf(value, -1.0f, 1.0f);
-        else if (command == F("HKI")) settings.holdKi = clampf(value, -0.5f, 0.5f);
-        else if (command == F("VKP")) settings.velocityKp = clampf(value, -1.0f, 1.0f);
-        else if (command == F("QA")) settings.qAngle = clampf(value, 0.0f, 1.0f);
-        else if (command == F("QG")) settings.qGyro = clampf(value, 0.0f, 1.0f);
-        else if (command == F("RA")) settings.rAngle = clampf(value, 0.0f, 10.0f);
-        else if (command == F("K1")) settings.k1 = clampf(value, 0.0f, 1.0f);
-        else if (command == F("MINPWM")) settings.minPwm = (uint8_t)clampf(value, 0.0f, 255.0f);
+        if (tokenEquals(command, "KP")) settings.kp = clampf(value, 0.0f, 200.0f);
+        else if (tokenEquals(command, "KI")) settings.ki = clampf(value, 0.0f, 50.0f);
+        else if (tokenEquals(command, "KD")) settings.kd = clampf(value, 0.0f, 20.0f);
+        else if (tokenEquals(command, "HKP")) settings.holdKp = clampf(value, -1.0f, 1.0f);
+        else if (tokenEquals(command, "HKI")) settings.holdKi = clampf(value, -0.5f, 0.5f);
+        else if (tokenEquals(command, "VKP")) settings.velocityKp = clampf(value, -1.0f, 1.0f);
+        else if (tokenEquals(command, "QA")) settings.qAngle = clampf(value, 0.0f, 1.0f);
+        else if (tokenEquals(command, "QG")) settings.qGyro = clampf(value, 0.0f, 1.0f);
+        else if (tokenEquals(command, "RA")) settings.rAngle = clampf(value, 0.0f, 10.0f);
+        else if (tokenEquals(command, "K1")) settings.k1 = clampf(value, 0.0f, 1.0f);
+        else if (tokenEquals(command, "MINPWM")) settings.minPwm = (uint8_t)clampf(value, 0.0f, 255.0f);
         applySettingsToSubsystems();
         scheduleSettingsSave();
         return true;
     }
 
-    if (command == F("SET")) {
+    if (tokenEquals(command, "SET")) {
         float values[12];
         for (uint8_t i = 0; i < 12; ++i) {
             if (!parseFloatToken(payload, values[i])) {
@@ -493,12 +575,13 @@ bool handleCommandLine(const String &line)
     return false;
 }
 
-void pollCommandStream(Stream &stream, String &buffer, Print &ackOut)
+void pollCommandStream(Stream &stream, char *buffer, uint8_t &length, Print &ackOut)
 {
     while (stream.available()) {
         const char c = (char)stream.read();
         if (c == '\r' || c == '\n') {
-            if (buffer.length() > 0) {
+            if (length > 0) {
+                buffer[length] = '\0';
                 const bool ok = handleCommandLine(buffer);
                 acknowledge(ackOut, ok);
                 if (!ok) {
@@ -506,11 +589,14 @@ void pollCommandStream(Stream &stream, String &buffer, Print &ackOut)
                     telemetry.sendEvent(F("CMD"), buffer);
                 }
             }
-            buffer = "";
-        } else if (buffer.length() < 160) {
-            buffer += c;
+            length = 0;
+            buffer[0] = '\0';
+        } else if (length < kCommandBufferCapacity) {
+            buffer[length++] = c;
+            buffer[length] = '\0';
         } else {
-            buffer = "";
+            length = 0;
+            buffer[0] = '\0';
         }
     }
 }
@@ -583,7 +669,10 @@ void runControlLoop(uint32_t nowUs)
             deltaAverageCount);
 
         if (fabs(imu.angleDeg()) > hw::kTiltFaultDeg) {
-            setFault(FaultCode::ExcessiveTilt, String(imu.angleDeg(), 2));
+            char detail[12];
+            dtostrf(imu.angleDeg(), 0, 2, detail);
+            trimWhitespace(detail);
+            setFault(FaultCode::ExcessiveTilt, detail);
             return;
         }
 
@@ -644,34 +733,40 @@ void loop()
     const uint32_t nowUs = micros();
 
     handleButton();
-    pollCommandStream(relaySerial, runtime.relayCommandBuffer, relaySerial);
-    pollCommandStream(Serial, runtime.usbCommandBuffer, Serial);
+    pollCommandStream(relaySerial, runtime.relayCommandBuffer, runtime.relayCommandLength, relaySerial);
+    pollCommandStream(Serial, runtime.usbCommandBuffer, runtime.usbCommandLength, Serial);
 
     runControlLoop(nowUs);
     runBringupMode(nowMs);
     saveSettingsIfDue(nowMs);
 
-    if (nowMs - runtime.lastStateTelemetryMs >= hw::kStateTelemetryMs) {
+    if (hw::kStateTelemetryMs > 0 && nowMs - runtime.lastStateTelemetryMs >= hw::kStateTelemetryMs) {
         runtime.lastStateTelemetryMs = nowMs;
         sendStateTelemetry();
     }
 
-    if (nowMs - runtime.lastSettingsTelemetryMs >= hw::kSettingsTelemetryMs) {
+    if (hw::kSettingsTelemetryMs > 0 && nowMs - runtime.lastSettingsTelemetryMs >= hw::kSettingsTelemetryMs) {
         runtime.lastSettingsTelemetryMs = nowMs;
-        sendSettingsTelemetry();
+
+        // Avoid long settings frames while balancing; relay serial writes can block
+        // enough to trigger control-loop jitter on AVR.
+        const bool balancingArmed = (runtime.mode == hw::SystemMode::Balance) && controller.armed();
+        if (!balancingArmed) {
+            sendSettingsTelemetry();
+        }
     }
 
-    if (nowMs - runtime.lastUsbEncoderTelemetryMs >= hw::kUsbEncoderTelemetryMs) {
+    if (hw::kUsbEncoderTelemetryMs > 0 && nowMs - runtime.lastUsbEncoderTelemetryMs >= hw::kUsbEncoderTelemetryMs) {
         runtime.lastUsbEncoderTelemetryMs = nowMs;
         sendEncoderTelemetry(true, false);
     }
 
-    if (nowMs - runtime.lastRelayEncoderTelemetryMs >= hw::kRelayEncoderTelemetryMs) {
+    if (hw::kRelayEncoderTelemetryMs > 0 && nowMs - runtime.lastRelayEncoderTelemetryMs >= hw::kRelayEncoderTelemetryMs) {
         runtime.lastRelayEncoderTelemetryMs = nowMs;
         sendEncoderTelemetry(false, true);
     }
 
-    if (nowMs - runtime.lastUsbRuntimeTelemetryMs >= hw::kUsbRuntimeTelemetryMs) {
+    if (hw::kUsbRuntimeTelemetryMs > 0 && nowMs - runtime.lastUsbRuntimeTelemetryMs >= hw::kUsbRuntimeTelemetryMs) {
         runtime.lastUsbRuntimeTelemetryMs = nowMs;
         telemetry.sendRuntime(
             imu.angleDeg(),
@@ -688,7 +783,7 @@ void loop()
         resetDtWindow();
     }
 
-    if (nowMs - runtime.lastRelayRuntimeTelemetryMs >= hw::kRelayRuntimeTelemetryMs) {
+    if (hw::kRelayRuntimeTelemetryMs > 0 && nowMs - runtime.lastRelayRuntimeTelemetryMs >= hw::kRelayRuntimeTelemetryMs) {
         runtime.lastRelayRuntimeTelemetryMs = nowMs;
         telemetry.sendRuntime(
             imu.angleDeg(),

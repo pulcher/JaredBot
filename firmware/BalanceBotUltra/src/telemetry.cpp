@@ -14,7 +14,7 @@ void Telemetry::sendBoot(const __FlashStringHelper *message)
     relay_.println(message);
 }
 
-void Telemetry::sendEvent(const __FlashStringHelper *eventName, const String &detail)
+void Telemetry::sendEvent(const __FlashStringHelper *eventName, const char *detail)
 {
     usb_.print(F("[EVENT] "));
     usb_.print(eventName);
@@ -27,7 +27,46 @@ void Telemetry::sendEvent(const __FlashStringHelper *eventName, const String &de
     relay_.println(detail);
 }
 
-void Telemetry::sendState(hw::SystemMode mode, bool armed, const String &faultName)
+void Telemetry::sendEvent(const __FlashStringHelper *eventName, const __FlashStringHelper *detail)
+{
+    usb_.print(F("[EVENT] "));
+    usb_.print(eventName);
+    usb_.print(F(" "));
+    usb_.println(detail);
+
+    relay_.print(F("F:"));
+    relay_.print(eventName);
+    relay_.print(F(","));
+    relay_.println(detail);
+}
+
+void Telemetry::sendFault(const __FlashStringHelper *faultCode, const char *detail)
+{
+    usb_.print(F("[EVENT] FAULT "));
+    usb_.print(faultCode);
+    usb_.print(F(","));
+    usb_.println(detail);
+
+    relay_.print(F("F:FAULT,"));
+    relay_.print(faultCode);
+    relay_.print(F(","));
+    relay_.println(detail);
+}
+
+void Telemetry::sendFault(const __FlashStringHelper *faultCode, const __FlashStringHelper *detail)
+{
+    usb_.print(F("[EVENT] FAULT "));
+    usb_.print(faultCode);
+    usb_.print(F(","));
+    usb_.println(detail);
+
+    relay_.print(F("F:FAULT,"));
+    relay_.print(faultCode);
+    relay_.print(F(","));
+    relay_.println(detail);
+}
+
+void Telemetry::sendState(hw::SystemMode mode, bool armed, const __FlashStringHelper *faultName)
 {
     printStateFrame(usb_, mode, armed, faultName);
     printStateFrame(relay_, mode, armed, faultName);
@@ -81,7 +120,7 @@ const __FlashStringHelper *Telemetry::modeName(hw::SystemMode mode) const
     return F("UNKNOWN");
 }
 
-void Telemetry::printStateFrame(Print &out, hw::SystemMode mode, bool armed, const String &faultName)
+void Telemetry::printStateFrame(Print &out, hw::SystemMode mode, bool armed, const __FlashStringHelper *faultName)
 {
     out.print(F("V:"));
     out.print(modeName(mode));
