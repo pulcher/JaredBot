@@ -38,26 +38,30 @@ for (var i = 0; i < tests.Count; i++)
     var test = tests[i];
     Console.WriteLine($"Upcoming test [{i + 1}/{tests.Count}]: {test.Id} - {test.Title}");
     Console.WriteLine($"Goal: {test.Goal}");
+    Console.WriteLine($"Checklist: {test.OperatorChecklist}");
     Console.WriteLine($"Expected duration: {test.Duration.TotalSeconds:0}s");
-    Console.Write("Type 'ready' to run this test, 'skip' to skip, or 'quit' to end session: ");
+    Console.Write("Type 'r' to run, 's' to skip, or 'q' to end session: ");
 
     var response = (Console.ReadLine() ?? string.Empty).Trim();
-    if (response.Equals("quit", StringComparison.OrdinalIgnoreCase))
+    if (response.Equals("q", StringComparison.OrdinalIgnoreCase) ||
+        response.Equals("quit", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine("Session ended by operator.");
         break;
     }
 
-    if (response.Equals("skip", StringComparison.OrdinalIgnoreCase))
+    if (response.Equals("s", StringComparison.OrdinalIgnoreCase) ||
+        response.Equals("skip", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine("Skipped.");
         Console.WriteLine();
         continue;
     }
 
-    if (!response.Equals("ready", StringComparison.OrdinalIgnoreCase))
+    if (!(response.Equals("r", StringComparison.OrdinalIgnoreCase) ||
+          response.Equals("ready", StringComparison.OrdinalIgnoreCase)))
     {
-        Console.WriteLine("Input not recognized as ready. Skipping this test.");
+        Console.WriteLine("Input not recognized as run command. Skipping this test.");
         Console.WriteLine();
         continue;
     }
@@ -98,9 +102,44 @@ static async Task<TestRunResult> ExecuteTestAsync(
     listener.AddMarker(markerStart);
 
     var sample = listener.BeginSample();
+    var stalled = false;
+    TelemetryEvent? stallWarn = null;
+    var endAtUtc = startedUtc + test.Duration;
+    var lastFrameCount = listener.TotalFrames;
+    var lastFrameProgressUtc = DateTime.UtcNow;
+    var stopCueShown = false;
+
     try
     {
-        await Task.Delay(test.Duration, cancellationToken);
+        while (DateTime.UtcNow < endAtUtc)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+
+            if (!stopCueShown &&
+                test.Id.Equals("controlled_stop", StringComparison.OrdinalIgnoreCase) &&
+                DateTime.UtcNow - startedUtc >= TimeSpan.FromSeconds(8))
+            {
+                stopCueShown = true;
+                Console.WriteLine("[cue] Send STOP now (dashboard stop/disarm or serial command C:STOP / C:ARM,0).");
+            }
+
+            var currentFrameCount = listener.TotalFrames;
+            if (currentFrameCount > lastFrameCount)
+            {
+                lastFrameCount = currentFrameCount;
+                lastFrameProgressUtc = DateTime.UtcNow;
+                continue;
+            }
+
+            if (DateTime.UtcNow - lastFrameProgressUtc >= TimeSpan.FromSeconds(2))
+            {
+                stalled = true;
+                stallWarn = TelemetryEvent.Marker("TEST_WARN", test.Id, "telemetry_stall", DateTime.UtcNow);
+                listener.AddMarker(stallWarn);
+                Console.WriteLine($"[warn] telemetry stalled during {test.Id}; ending test early.");
+                break;
+            }
+        }
     }
     finally
     {
@@ -108,11 +147,15 @@ static async Task<TestRunResult> ExecuteTestAsync(
     }
 
     var endedUtc = DateTime.UtcNow;
-    var markerEnd = TelemetryEvent.Marker("TEST_END", test.Id, "complete", endedUtc);
+    var markerEnd = TelemetryEvent.Marker("TEST_END", test.Id, stalled ? "telemetry_stall" : "complete", endedUtc);
     listener.AddMarker(markerEnd);
 
     var events = sample.Events;
     events.Insert(0, markerStart);
+    if (stalled && stallWarn is not null)
+    {
+        events.Add(stallWarn);
+    }
     events.Add(markerEnd);
 
     var summary = TestSummary.FromEvents(test, startedUtc, endedUtc, events, listener.LastConfigSnapshot);
@@ -177,6 +220,8 @@ internal sealed class TelemetryListener
 
     private volatile bool _hasSeenAnyFrame;
     private ControlConfigSnapshot? _lastConfig;
+    private long _totalFrames;
+    private DateTime _lastFrameUtc = DateTime.MinValue;
 
     public TelemetryListener(Uri uri)
     {
@@ -184,6 +229,28 @@ internal sealed class TelemetryListener
     }
 
     public bool HasSeenAnyFrame => _hasSeenAnyFrame;
+    public long TotalFrames
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _totalFrames;
+            }
+        }
+    }
+
+    public DateTime LastFrameUtc
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _lastFrameUtc;
+            }
+        }
+    }
+
     public ControlConfigSnapshot? LastConfigSnapshot
     {
         get
@@ -283,6 +350,9 @@ internal sealed class TelemetryListener
 
             lock (_sync)
             {
+                _totalFrames++;
+                _lastFrameUtc = evt.UtcTimestamp;
+
                 if (config is not null)
                 {
                     _lastConfig = config;
@@ -372,7 +442,7 @@ internal static class TestCatalog
                 "Controlled stop",
                 "Validate safe stop behavior and post-stop telemetry consistency.",
                 duration,
-                "Disarm/stop command at ~8s mark.")
+                "At ~8s, issue a stop/disarm (dashboard button or serial C:STOP / C:ARM,0), then let test finish.")
         };
     }
 }

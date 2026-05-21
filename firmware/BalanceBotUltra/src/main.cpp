@@ -16,6 +16,7 @@
 namespace {
 
 constexpr uint8_t kCommandBufferCapacity = 160;
+constexpr unsigned long kRuntimeTelemetryGapWarnMs = 2000;
 
 enum class FaultCode : uint8_t {
     None = 0,
@@ -52,6 +53,8 @@ struct RuntimeContext
     unsigned long lastMotorTestStepMs = 0;
     unsigned long lastImuTestMs = 0;
     unsigned long lastLoopJitterWarnMs = 0;
+    unsigned long lastAnyRuntimeTelemetryMs = 0;
+    unsigned long lastRuntimeGapWarnMs = 0;
 
     long lastUsbLeftCount = 0;
     long lastUsbRightCount = 0;
@@ -719,6 +722,8 @@ void setup()
     runtime.lastRelayEncoderTelemetryMs = millis();
     runtime.lastSettingsTelemetryMs = millis();
     runtime.lastStateTelemetryMs = millis();
+    runtime.lastAnyRuntimeTelemetryMs = millis();
+    runtime.lastRuntimeGapWarnMs = 0;
     sendFullStatus();
 
     if (hw::kAutoArmAfterCalibration && runtime.mode == hw::SystemMode::Idle) {
@@ -780,6 +785,7 @@ void loop()
             runtime.dtCount,
             true,
             false);
+        runtime.lastAnyRuntimeTelemetryMs = nowMs;
         resetDtWindow();
     }
 
@@ -797,6 +803,16 @@ void loop()
             runtime.dtCount,
             false,
             true);
+        runtime.lastAnyRuntimeTelemetryMs = nowMs;
         resetDtWindow();
+    }
+
+    // If runtime frames stop flowing, emit explicit warning + state so clients can
+    // tell the difference between a quiet bot and a telemetry stall.
+    if (nowMs - runtime.lastAnyRuntimeTelemetryMs >= kRuntimeTelemetryGapWarnMs &&
+        nowMs - runtime.lastRuntimeGapWarnMs >= kRuntimeTelemetryGapWarnMs) {
+        runtime.lastRuntimeGapWarnMs = nowMs;
+        telemetry.sendEvent(F("WARN"), F("runtime_gap"));
+        sendStateTelemetry();
     }
 }

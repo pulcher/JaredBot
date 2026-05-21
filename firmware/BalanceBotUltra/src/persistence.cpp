@@ -6,7 +6,7 @@
 namespace {
 
 static const uint16_t kMagic = 0x4242;
-static const uint8_t kVersion = 1;
+static const uint8_t kVersion = 4;
 
 struct SettingsRecord
 {

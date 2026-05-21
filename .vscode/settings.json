@@ -2,6 +2,7 @@
     "chat.tools.terminal.autoApprove": {
         "dotnet build": true,
         "dotnet run": true,
-        "pio": true
+        "pio": true,
+        "Get-WmiObject": true
     }
 }
